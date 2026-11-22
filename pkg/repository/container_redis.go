@@ -199,6 +199,7 @@ func (cr *ContainerRedisRepository) GetContainerState(containerId string) (*type
 	if err = common.ToStruct(res, state); err != nil {
 		return nil, fmt.Errorf("failed to deserialize container state <%v>: %v", stateKey, err)
 	}
+	state.SettlePending()
 
 	return state, nil
 }
@@ -281,6 +282,11 @@ func containerStateFields(containerId string, state *types.ContainerState) []int
 		"evictable", state.Evictable,
 		"drain_seconds", state.DrainSeconds,
 		"evict_order", state.EvictOrder,
+		// Empty for a container that is admitted: what an earlier container
+		// of the same id waited for is not this one's.
+		"pending_phase", string(state.PendingPhase),
+		"pending_reason", string(state.PendingReason),
+		"pending_since", state.PendingSince,
 	}
 }
 
@@ -512,6 +518,7 @@ func (cr *ContainerRedisRepository) updateUnlockedContainerStatus(containerId st
 	if err := common.ToStruct(stored, state); err != nil {
 		return nil, false, fmt.Errorf("failed to deserialize container state: %v", err)
 	}
+	state.SettlePending()
 	return state, false, nil
 }
 
@@ -671,6 +678,34 @@ func (cr *ContainerRedisRepository) MarkPendingContainerStoppingIfUnassigned(con
 		return false, fmt.Errorf("failed to stop unassigned pending container <%s>: %w", containerId, err)
 	}
 	return marked, nil
+}
+
+// setContainerPendingScript stores what a container waits for on its state
+// (KEYS[1]) while the state is PENDING, so a state that is gone is not made
+// anew. The state keeps the expiry it has.
+var setContainerPendingScript = redis.NewScript(`
+if redis.call("HGET", KEYS[1], "status") ~= ARGV[1] then
+	return 0
+end
+redis.call("HSET", KEYS[1], "pending_phase", ARGV[2], "pending_reason", ARGV[3], "pending_since", ARGV[4])
+return 1
+`)
+
+// SetContainerPending stores what a container that has not started waits
+// for, and since when (types.ContainerPendingPhase). It reports whether it
+// did: a container that runs, is stopping or is gone is left as it is.
+//
+// It takes no lock. It writes only its own fields, in one step, and what it
+// writes is read only to be shown.
+func (cr *ContainerRedisRepository) SetContainerPending(containerId string, phase types.ContainerPendingPhase, reason types.ContainerPendingReason, since time.Time) (bool, error) {
+	stored, err := setContainerPendingScript.Run(context.TODO(), cr.rdb,
+		[]string{common.RedisKeys.SchedulerContainerState(containerId)},
+		string(types.ContainerStatusPending), string(phase), string(reason), since.Unix(),
+	).Bool()
+	if err != nil {
+		return false, fmt.Errorf("failed to store what pending container <%s> waits for: %w", containerId, err)
+	}
+	return stored, nil
 }
 
 func (cr *ContainerRedisRepository) DeleteContainerState(containerId string) error {
@@ -1260,6 +1295,7 @@ func (cr *ContainerRedisRepository) listContainerStateByIndex(indexKey string, k
 		if state.ContainerId == "" {
 			continue
 		}
+		state.SettlePending()
 		containerStates = append(containerStates, state)
 	}
 
@@ -1484,6 +1520,7 @@ func (cr *ContainerRedisRepository) GetContainersByStubId(stubId string) ([]type
 		if err := common.ToStruct(fields, &state); err != nil || state.ContainerId == "" {
 			continue
 		}
+		state.SettlePending()
 		containerStates = append(containerStates, state)
 	}
 	if len(stale) > 0 {
@@ -2217,6 +2254,35 @@ func (cr *ContainerRedisRepository) GetContainerRequestStatus(containerId string
 	}
 
 	return types.ContainerRequestStatus(status), nil
+}
+
+// SetContainerRequestFailure keeps why the scheduler gave up on a container
+// request, for as long as the request's status is kept.
+func (cr *ContainerRedisRepository) SetContainerRequestFailure(containerId string, failure types.ContainerRequestFailure) error {
+	encoded, err := json.Marshal(failure)
+	if err != nil {
+		return err
+	}
+	return cr.rdb.Set(context.TODO(), common.RedisKeys.SchedulerContainerRequestFailure(containerId), encoded, types.ContainerRequestStatusTTL).Err()
+}
+
+// GetContainerRequestFailure returns why the scheduler gave up on a
+// container request, or nil if it did not, or did so too long ago for the
+// reason to have been kept.
+func (cr *ContainerRedisRepository) GetContainerRequestFailure(containerId string) (*types.ContainerRequestFailure, error) {
+	encoded, err := cr.rdb.Get(context.TODO(), common.RedisKeys.SchedulerContainerRequestFailure(containerId)).Bytes()
+	if err == redis.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	failure := &types.ContainerRequestFailure{}
+	if err := json.Unmarshal(encoded, failure); err != nil {
+		return nil, err
+	}
+	return failure, nil
 }
 
 func (cr *ContainerRedisRepository) SetBuildContainerTTL(containerId string, ttl time.Duration) error {

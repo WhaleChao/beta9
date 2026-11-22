@@ -128,8 +128,19 @@ See [references/deploy.md](references/deploy.md#docker-compose-projects).
   the workspace has no prepaid credit; deploys and database creation are
   refused up front. Do not retry in a loop. Tell the user, give them the
   credits link from the message, and continue once they confirm.
-- Capacity errors name the GPU; offer a fallback type or a list, e.g.
-  `gpu: ["A10G", "A100-40"]`.
+- A task that has not started says what it waits for: `get_task` carries
+  `pending`, with a `phase` and a `message`. `provisioning` means no warm
+  machine had room and one is starting, which takes minutes: keep waiting.
+  `waiting_for_capacity` means no machine can be had right now.
+- Code `CAPACITY`, or a task whose `failure_reason` says that no capacity
+  became available, is a platform limit and not a bug in the user's code.
+  Do not edit the code and do not retry in a loop. Tell the user, and offer
+  a list of GPU types (`gpu: ["A10G", "A100-40"]`: the first with capacity
+  is used), a reserved machine (`{{cli}} machine list` shows on-demand and
+  spot prices; it is billed by the hour, so ask first), or trying later. A
+  script that should not wait sets `BETA9_CAPACITY_WAIT=<seconds>`
+  (`BEAM_CAPACITY_WAIT` with the Beam CLI): the call is then given up after
+  that long without a machine, and raises `NoCapacityError`.
 - Roll back with `redeploy` and an older `deployment_id`; stop a bad version
   with `stop_deployment`. See [references/operate.md](references/operate.md).
 

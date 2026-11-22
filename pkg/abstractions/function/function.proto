@@ -30,6 +30,15 @@ message FunctionInvokeResponse {
   int32 exit_code = 4;
   bytes result = 5;
   string container_id = 6;
+  // What the invocation waits for before its container runs, on a response
+  // that carries no output: the phase (queued, provisioning,
+  // waiting_for_capacity or starting), why (worker_starting,
+  // backup_worker_starting, no_capacity, machine_busy or no_spare_capacity),
+  // how long it has been so, and the same in words.
+  string pending_phase = 7;
+  string pending_reason = 8;
+  uint32 pending_waited_seconds = 9;
+  string pending_message = 10;
 }
 
 message FunctionGetArgsRequest { string task_id = 1; }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	abstractions "github.com/beam-cloud/beta9/pkg/abstractions/common"
@@ -270,10 +271,31 @@ func (gws *GatewayService) AttachToContainer(stream pb.GatewayService_AttachToCo
 		}()
 	}
 
+	// The container stream and the keepalive below send from goroutines of
+	// their own, and a stream takes one Send at a time.
+	var sending sync.Mutex
+	send := func(response *pb.AttachToContainerResponse) error {
+		sending.Lock()
+		defer sending.Unlock()
+		return stream.Send(response)
+	}
+
 	sendCallback := func(o common.OutputMsg) error {
-		return stream.Send(&pb.AttachToContainerResponse{
+		return send(&pb.AttachToContainerResponse{
 			Output: o.Msg,
 		})
+	}
+
+	// Until the container runs there is no output. The client is shown what
+	// the container waits for instead, as a line of output each time that
+	// changes: a machine that is starting, or capacity that is not there yet.
+	var shown types.Pending
+	pendingCallback := func(pending types.Pending) error {
+		if pending.Phase == types.ContainerPendingQueued || (pending.Phase == shown.Phase && pending.Reason == shown.Reason) {
+			return nil
+		}
+		shown = pending
+		return send(&pb.AttachToContainerResponse{Output: pending.Message + "\n"})
 	}
 
 	exitCallback := func(exitCode int32) error {
@@ -284,7 +306,7 @@ func (gws *GatewayService) AttachToContainer(stream pb.GatewayService_AttachToCo
 				output = exitCodeMessage
 			}
 		}
-		return stream.Send(&pb.AttachToContainerResponse{
+		return send(&pb.AttachToContainerResponse{
 			Done:     true,
 			ExitCode: exitCode,
 			Output:   output,
@@ -299,6 +321,7 @@ func (gws *GatewayService) AttachToContainer(stream pb.GatewayService_AttachToCo
 	containerStream, err := abstractions.NewContainerStream(abstractions.ContainerStreamOpts{
 		SendCallback:    sendCallback,
 		ExitCallback:    exitCallback,
+		PendingCallback: pendingCallback,
 		ContainerRepo:   gws.containerRepo,
 		Config:          gws.appConfig,
 		Tailscale:       gws.tailscale,
@@ -325,7 +348,7 @@ func (gws *GatewayService) AttachToContainer(stream pb.GatewayService_AttachToCo
 			case <-ctx.Done():
 				return
 			case <-keepaliveTicker.C:
-				stream.Send(&pb.AttachToContainerResponse{
+				send(&pb.AttachToContainerResponse{
 					Output: "",
 				})
 			}
@@ -366,6 +389,8 @@ func (gws *GatewayService) AttachToContainer(stream pb.GatewayService_AttachToCo
 	// Wait for the container stream or the client message loop to finish
 	select {
 	case err := <-streamErrCh:
+		// A container the scheduler gave up on: the client is told why.
+		abstractions.NotScheduled(stream, err)
 		return err
 	case err := <-clientMsgErrCh:
 		cancel()

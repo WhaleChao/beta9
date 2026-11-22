@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"slices"
 	"strings"
 	"time"
 
@@ -61,6 +62,36 @@ const (
 	// endpoint replicas, and once the scheduling window ends for Spot.
 	ContainerSchedulingFailureNoOpportunisticCapacity ContainerSchedulingFailureReason = "no_opportunistic_capacity"
 )
+
+// ContainerRequestFailure is why the scheduler gave up on a container
+// request, and what the request asked for. It is kept for a while after the
+// container's state is gone (ContainerRequestStatusTTL), for whoever was
+// waiting for the container.
+type ContainerRequestFailure struct {
+	Reason ContainerSchedulingFailureReason `json:"reason"`
+	// PoolSelector is the pool the request named, if it named one.
+	PoolSelector string `json:"pool_selector,omitempty"`
+	// Gpus are the GPU types the request could run on, in the order it asked
+	// for them. A request for no GPU has none.
+	Gpus []string `json:"gpus,omitempty"`
+	// WaitedSeconds is how long the scheduler tried.
+	WaitedSeconds int64 `json:"waited_seconds,omitempty"`
+}
+
+// NoCapacity reports whether the scheduler gave up for want of capacity:
+// the same request can succeed later, and one for other hardware can succeed
+// now.
+func (f ContainerRequestFailure) NoCapacity() bool {
+	switch f.Reason {
+	case ContainerSchedulingFailureProvisioningLimit,
+		ContainerSchedulingFailureWorkerCapacityTimeout,
+		ContainerSchedulingFailureRetryLimit,
+		ContainerSchedulingFailureManagedFallbackNoCapacity,
+		ContainerSchedulingFailureNoOpportunisticCapacity:
+		return true
+	}
+	return false
+}
 
 // @go2proto
 type Worker struct {
@@ -243,6 +274,41 @@ const (
 	ContainerStatusStopping ContainerStatus = "STOPPING"
 )
 
+// ContainerPendingPhase is what a container that has not started waits for.
+// Its status is PENDING from when it is asked for until it runs: a second on
+// a worker that has room, minutes when a machine has to start, and until the
+// scheduling limit when there is no capacity to be had. The phase and its
+// reason tell those apart, for whoever waits with the container.
+type ContainerPendingPhase string
+
+// ContainerPendingReason says why a container is in its pending phase.
+type ContainerPendingReason string
+
+const (
+	// Not placed yet, and nothing else is known.
+	ContainerPendingQueued ContainerPendingPhase = "queued"
+	// No worker had room, and a pool is adding one.
+	ContainerPendingProvisioning ContainerPendingPhase = "provisioning"
+	// No worker has room, and none is on its way.
+	ContainerPendingWaitingForCapacity ContainerPendingPhase = "waiting_for_capacity"
+	// A worker has it and is starting it.
+	ContainerPendingStarting ContainerPendingPhase = "starting"
+
+	// The pool the request prefers is adding a worker.
+	ContainerPendingWorkerStarting ContainerPendingReason = "worker_starting"
+	// The pool the request prefers could not take it, and a pool further
+	// down its route is adding a worker. A Spot pool with no capacity that is
+	// followed by an on-demand pool gives this.
+	ContainerPendingBackupWorkerStarting ContainerPendingReason = "backup_worker_starting"
+	// No pool that may run the request can add a worker now.
+	ContainerPendingNoCapacity ContainerPendingReason = "no_capacity"
+	// The one machine the request may run on has no room.
+	ContainerPendingMachineBusy ContainerPendingReason = "machine_busy"
+	// The request runs only on capacity that nothing else is using (the Spot
+	// CPU tier), and there is none.
+	ContainerPendingNoSpareCapacity ContainerPendingReason = "no_spare_capacity"
+)
+
 type ContainerAlreadyScheduledError struct {
 	Msg string
 }
@@ -275,11 +341,121 @@ type ContainerState struct {
 	EvictOrder   int32  `redis:"evict_order" json:"evict_order,omitempty"`
 	// ReservedCpu mirrors ContainerRequest.ReservedCpu for the scheduled request.
 	ReservedCpu int64 `redis:"reserved_cpu" json:"reserved_cpu,omitempty" go2proto:"ignore"`
+	// PendingPhase and PendingReason say what a container that has not
+	// started waits for, and PendingSince since when, in Unix seconds. The
+	// scheduler stores them while the container waits for a worker, and a
+	// state that is read from the store is settled before it is handed out
+	// (SettlePending), so that they say what the container waits for now.
+	PendingPhase  ContainerPendingPhase  `redis:"pending_phase" json:"pending_phase,omitempty" go2proto:"ignore"`
+	PendingReason ContainerPendingReason `redis:"pending_reason" json:"pending_reason,omitempty" go2proto:"ignore"`
+	PendingSince  int64                  `redis:"pending_since" json:"pending_since,omitempty" go2proto:"ignore"`
 }
 
 // CapacityCpu is the CPU the container takes from its worker's capacity.
 func (s *ContainerState) CapacityCpu() int64 {
 	return max(s.ReservedCpu, s.Cpu)
+}
+
+// SettlePending makes the pending fields say what the container waits for
+// now, from what the scheduler last stored in them. A container that runs or
+// is stopping waits for nothing. One that a worker has is starting, whatever
+// it waited for before. One the scheduler has said nothing about is queued,
+// since it was asked for.
+func (s *ContainerState) SettlePending() {
+	switch {
+	case s.Status != ContainerStatusPending:
+		s.PendingPhase, s.PendingReason, s.PendingSince = "", "", 0
+	case s.WorkerId != "":
+		// When the worker took it is not kept.
+		s.PendingPhase, s.PendingReason, s.PendingSince = ContainerPendingStarting, "", 0
+	case s.PendingPhase == "":
+		s.PendingPhase, s.PendingReason, s.PendingSince = ContainerPendingQueued, "", s.ScheduledAt
+	}
+}
+
+// Pending is what something that has not started waits for, as its callers
+// are told it: a container, or a task whose container has not started.
+type Pending struct {
+	Phase  ContainerPendingPhase  `json:"phase" serializer:"phase"`
+	Reason ContainerPendingReason `json:"reason,omitempty" serializer:"reason,omitempty"`
+	// WaitedSeconds is how long it has waited in this phase, for this
+	// reason.
+	WaitedSeconds int64 `json:"waited_seconds" serializer:"waited_seconds"`
+	// Message says the phase and reason in words. Every client shows these
+	// words, so that they read the same in a terminal, the API and the
+	// dashboard.
+	Message string `json:"message" serializer:"message"`
+}
+
+// Pending is what the container waits for at a given time, or nil for one
+// that runs or is stopping. The state is one that was read from the store
+// (see SettlePending).
+func (s *ContainerState) Pending(now time.Time) *Pending {
+	if s.Status != ContainerStatusPending || s.PendingPhase == "" {
+		return nil
+	}
+	pending := &Pending{Phase: s.PendingPhase, Reason: s.PendingReason, Message: s.PendingPhase.Message(s.PendingReason)}
+	if s.PendingSince > 0 {
+		pending.WaitedSeconds = max(now.Unix()-s.PendingSince, 0)
+	}
+	return pending
+}
+
+// Message says what a container in this phase, for this reason, waits for.
+func (phase ContainerPendingPhase) Message(reason ContainerPendingReason) string {
+	switch {
+	case phase == ContainerPendingQueued:
+		return "Waiting to be placed on a machine"
+	case phase == ContainerPendingStarting:
+		return "Placed on a machine, starting the container"
+	case reason == ContainerPendingBackupWorkerStarting:
+		return "Preferred capacity is unavailable, starting a machine on backup capacity"
+	case phase == ContainerPendingProvisioning:
+		return "No warm machine, starting one"
+	case reason == ContainerPendingMachineBusy:
+		return "The machine it is pinned to is full, waiting for room"
+	case reason == ContainerPendingNoSpareCapacity:
+		return "The Spot tier has no spare capacity right now, waiting for some"
+	case phase == ContainerPendingWaitingForCapacity:
+		return "No capacity available right now, waiting for some"
+	}
+	return ""
+}
+
+// pendingProgress orders the phases by how close a container in them is to
+// running.
+var pendingProgress = map[ContainerPendingPhase]int{
+	ContainerPendingQueued:       1,
+	ContainerPendingProvisioning: 2,
+	ContainerPendingStarting:     3,
+}
+
+// PendingOf is what work that has not started waits for, given its stub's
+// containers. Work that was given a container of its own (a function call)
+// waits for what that container waits for. Work that any of them can take
+// (an endpoint or task queue task) waits for nothing that can be said if one
+// of them runs, and otherwise for what the one closest to running waits for;
+// of two that are as close, the one that has waited longer.
+func PendingOf(containers []ContainerState, own string, now time.Time) *Pending {
+	var closest *Pending
+	for i := range containers {
+		switch {
+		case own != "" && containers[i].ContainerId != own:
+			continue
+		case containers[i].Status == ContainerStatusRunning:
+			return nil
+		}
+		pending := containers[i].Pending(now)
+		if pending == nil {
+			continue
+		}
+		if closest == nil ||
+			pendingProgress[pending.Phase] > pendingProgress[closest.Phase] ||
+			(pending.Phase == closest.Phase && pending.WaitedSeconds > closest.WaitedSeconds) {
+			closest = pending
+		}
+	}
+	return closest
 }
 
 // ContainerLeaseRenewal is one container in a worker's routine status
@@ -504,6 +680,11 @@ type ContainerRequest struct {
 	// wire fields below it, ignored by go2proto or not.
 	WaitlistPool string    `json:"waitlist_pool,omitempty" go2proto:"ignore"`
 	WaitlistedAt time.Time `json:"waitlisted_at,omitzero" go2proto:"ignore"`
+	// PendingReported is what the scheduler last stored on the container's
+	// state about what the request waits for. The request passes several
+	// times a second while it waits, and stores only what has changed. Set
+	// by the scheduler, never by callers.
+	PendingReported string `json:"pending_reported,omitempty" go2proto:"ignore"`
 }
 
 // CapacityCpu is the CPU the request takes from its worker's capacity.
@@ -553,6 +734,21 @@ const (
 	ContainerNetworkPolicyBlock     ContainerNetworkPolicy = "block"
 	ContainerNetworkPolicyAllowList ContainerNetworkPolicy = "allowlist"
 )
+
+// RequestedGpus are the GPU types the request can run on, in the order it
+// asked for them.
+func (c *ContainerRequest) RequestedGpus() []string {
+	var gpus []string
+	for _, gpu := range c.GpuRequest {
+		if gpu != "" && gpu != string(NO_GPU) && !slices.Contains(gpus, gpu) {
+			gpus = append(gpus, gpu)
+		}
+	}
+	if len(gpus) == 0 && c.Gpu != "" && c.Gpu != string(NO_GPU) {
+		gpus = append(gpus, c.Gpu)
+	}
+	return gpus
+}
 
 func (c *ContainerRequest) RequiresGPU() bool {
 	for _, gpu := range c.GpuRequest {

@@ -324,6 +324,11 @@ func (g *TaskGroup) addStatsToTask(ctx context.Context, workspaceName string, ta
 		return err
 	}
 	task.Stats.ActiveContainers = uint32(len(activeContainers))
+	// A task that has not started says what it waits for: a machine that is
+	// starting, or capacity that is not there yet.
+	if task.Status == types.TaskStatusPending || task.Status == types.TaskStatusRetry {
+		task.Pending = types.PendingOf(activeContainers, task.ContainerId, time.Now())
+	}
 
 	return nil
 }

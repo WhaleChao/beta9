@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"errors"
+	"fmt"
 	"slices"
 	"sync"
 	"time"
@@ -160,12 +161,15 @@ func (a *schedulingAttempt) grow() {
 		a.fail(types.ContainerSchedulingFailureProvisioningLimit)
 		return
 	case choice.pool == nil:
+		// No worker has room, none is on its way, and no pool can add one.
+		a.waitsFor(types.ContainerPendingWaitingForCapacity, types.ContainerPendingNoCapacity)
 		a.askAgainLater("worker_provisioning_backoff")
 		return
 	case buyer(choice.pool.Controller) != nil:
 		// Such a pool buys for all the requests that wait for it together
 		// (see pool_buying.go).
 		s.joinWaitlist(a.request, choice.pool)
+		a.waitsForWorker(choice.pool)
 		a.askAgainLater("worker_provisioning_in_progress")
 		return
 	}
@@ -179,6 +183,8 @@ func (a *schedulingAttempt) grow() {
 		if !errors.Is(err, redislock.ErrNotObtained) {
 			requestLog(log.Error(), a.request).Err(err).Msg("unable to acquire worker provisioning lock")
 		}
+		// The lock is held for a worker that was asked for this container.
+		a.waitsForWorker(choice.pool)
 		a.askAgainLater("worker_provisioning_in_progress")
 		return
 	}
@@ -191,6 +197,7 @@ func (a *schedulingAttempt) grow() {
 	a.request.GrowAttempts[choice.pool.Name]++
 	reservationID := s.provisioning.addReservation(s, a.request, choice.pool, choice.size)
 	s.background(func() { s.addWorker(a.request, choice.pool, choice.size, reservationID) })
+	a.waitsForWorker(choice.pool)
 	a.requeueForWorkerWait()
 }
 
@@ -207,6 +214,77 @@ func (s *Scheduler) machineComing(route route) bool {
 		booting, err := buying.provisioner.Booting(buying.ctx, buying.poolName())
 		return err != nil || len(booting) > 0
 	})
+}
+
+// What a waiting request waits for.
+//
+// A container is PENDING from when it is asked for until it runs: a second
+// when a worker has room, minutes when a machine has to start, the whole
+// scheduling window when there is no capacity. The scheduler knows which, so
+// it stores it on the container's state (types.ContainerPendingPhase) each
+// time it sends a request back to wait, for whoever waits with the container.
+//
+// A request passes several times a second while it waits. It carries what it
+// stored last (ContainerRequest.PendingReported) and stores only a change.
+
+// waitsFor stores that the request waits in this phase, for this reason.
+func (a *schedulingAttempt) waitsFor(phase types.ContainerPendingPhase, reason types.ContainerPendingReason) {
+	a.storePending(a.pendingKey(phase, string(reason)), phase, reason)
+}
+
+// waitsForWorker stores that the request waits for a worker that the pool is
+// adding. The pool is nil when it is not known.
+func (a *schedulingAttempt) waitsForWorker(pool *WorkerPool) {
+	if pool == nil {
+		a.waitsFor(types.ContainerPendingProvisioning, types.ContainerPendingWorkerStarting)
+		return
+	}
+	// The pool decides the reason, and the route is not worked out again
+	// for a pool that was stored already.
+	key := a.pendingKey(types.ContainerPendingProvisioning, "pool:"+pool.Name)
+	if a.request.PendingReported == key {
+		return
+	}
+	reason := types.ContainerPendingWorkerStarting
+	if a.scheduler.routeFor(a.request).backup(pool.Name) {
+		reason = types.ContainerPendingBackupWorkerStarting
+	}
+	a.storePending(key, types.ContainerPendingProvisioning, reason)
+}
+
+// pendingKey names what the request waits for, to compare with what it
+// stored last. A request that a worker had and gave back has a new
+// timestamp, so it stores what it waits for anew, and since when.
+func (a *schedulingAttempt) pendingKey(phase types.ContainerPendingPhase, detail string) string {
+	return fmt.Sprintf("%s/%s/%d", phase, detail, a.request.Timestamp.UnixNano())
+}
+
+func (a *schedulingAttempt) storePending(key string, phase types.ContainerPendingPhase, reason types.ContainerPendingReason) {
+	if a.request.PendingReported == key {
+		return
+	}
+	// A container that is no longer waiting keeps its state as it is, and
+	// the request stops asking for it.
+	if _, err := a.scheduler.containerRepo.SetContainerPending(a.request.ContainerId, phase, reason, a.scheduler.now()); err != nil {
+		// It is only shown, and is stored on the next pass instead.
+		requestLog(log.Debug(), a.request).Err(err).Msg("unable to store what the request waits for")
+		return
+	}
+	a.request.PendingReported = key
+}
+
+// backup reports whether the route tries the pool only after another one.
+// Pools that the route orders by name alone are tried first together, and
+// none of them is a backup for the others. A pool that is not in the route
+// is not known to be one.
+func (r route) backup(name string) bool {
+	i := slices.IndexFunc(r.pools, func(pool routedPool) bool { return pool.Name == name })
+	if i <= 0 {
+		return false
+	}
+	first, pool := r.pools[0], r.pools[i]
+	return pool.overflow != first.overflow || pool.fallback != first.fallback ||
+		pool.asked != first.asked || pool.Config.Priority != first.Config.Priority
 }
 
 // askAgainLater requeues a request that no pool could be asked for a worker

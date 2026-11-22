@@ -2,6 +2,7 @@ package abstractions
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
@@ -10,6 +11,8 @@ import (
 	taskdispatcher "github.com/beam-cloud/beta9/pkg/task"
 	"github.com/beam-cloud/beta9/pkg/types"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type schedulingFailureBackend struct {
@@ -54,12 +57,13 @@ func TestTaskSchedulingFailureEndsTaskAndClearsDispatcherState(t *testing.T) {
 	}}
 	handler := &taskSchedulingFailureHandler{backendRepo: backend, dispatcher: dispatcher}
 
-	handled := handler.handle(common.NewContainerSchedulingFailedEvent(common.ContainerSchedulingFailure{
+	event := common.NewContainerSchedulingFailedEvent(common.ContainerSchedulingFailure{
 		TaskID:       "task-id",
 		ContainerID:  "container-id",
 		PoolSelector: "my-pool",
 		Reason:       types.ContainerSchedulingFailureWorkerCapacityTimeout,
-	}))
+	})
+	handled := handler.handle(event)
 
 	require.True(t, handled)
 	require.Equal(t, types.TaskStatusError, backend.task.Status)
@@ -67,10 +71,20 @@ func TestTaskSchedulingFailureEndsTaskAndClearsDispatcherState(t *testing.T) {
 	require.Equal(t, "No compatible worker in pool \"my-pool\" became available before scheduling timed out. Check that a machine is online and has enough CPU, memory, and GPU capacity.", backend.task.FailureReason)
 	_, err = taskRepo.GetTaskState(ctx, "workspace", "stub-id", "task-id")
 	require.Error(t, err)
+
+	// The scheduler keeps what the request asked for and how long it tried
+	// with the request. The task says them when they are there.
+	backend.task.Status = types.TaskStatusPending
+	handler.containerRepo = repository.NewContainerRedisRepositoryForTest(rdb)
+	require.NoError(t, handler.containerRepo.SetContainerRequestFailure("container-id", types.ContainerRequestFailure{
+		Reason: types.ContainerSchedulingFailureWorkerCapacityTimeout, Gpus: []string{"A10G"}, WaitedSeconds: 1200,
+	}))
+	require.True(t, handler.handle(event))
+	require.Equal(t, "No A10G capacity became available in 20 minutes.", backend.task.FailureReason)
 }
 
 func TestSchedulingFailureMessageExplainsWorkerProvisioningLimit(t *testing.T) {
-	message := schedulingFailureMessage(common.ContainerSchedulingFailure{
+	message := SchedulingFailureMessage(types.ContainerRequestFailure{
 		Reason:       types.ContainerSchedulingFailureProvisioningLimit,
 		PoolSelector: "gpu-pool",
 	})
@@ -79,7 +93,7 @@ func TestSchedulingFailureMessageExplainsWorkerProvisioningLimit(t *testing.T) {
 }
 
 func TestSchedulingFailureMessageExplainsSpotCapacityTimeout(t *testing.T) {
-	message := schedulingFailureMessage(common.ContainerSchedulingFailure{Reason: types.ContainerSchedulingFailureNoOpportunisticCapacity})
+	message := SchedulingFailureMessage(types.ContainerRequestFailure{Reason: types.ContainerSchedulingFailureNoOpportunisticCapacity})
 
 	require.Equal(t, "No spare capacity became available for this Spot workload before scheduling timed out. Try again later, or use the shared or performance CPU tier.", message)
 }
@@ -98,4 +112,43 @@ func TestTaskSchedulingFailureIgnoresStaleContainer(t *testing.T) {
 
 	require.True(t, handled)
 	require.Equal(t, types.TaskStatusPending, backend.task.Status)
+}
+
+// A request that named no pool ran on capacity that is not its caller's to
+// check: it is told what there was none of, and for how long.
+func TestSchedulingFailureMessageNamesTheCapacityAServerlessRequestAskedFor(t *testing.T) {
+	for message, failure := range map[string]types.ContainerRequestFailure{
+		"No A10G capacity became available in 20 minutes.": {
+			Reason: types.ContainerSchedulingFailureWorkerCapacityTimeout, Gpus: []string{"A10G"}, WaitedSeconds: 1200,
+		},
+		"No A10G, L4 or T4 capacity became available in 45 seconds.": {
+			Reason: types.ContainerSchedulingFailureRetryLimit, Gpus: []string{"A10G", "L4", "T4"}, WaitedSeconds: 45,
+		},
+		"No capacity became available before scheduling timed out.": {
+			Reason: types.ContainerSchedulingFailureWorkerCapacityTimeout,
+		},
+		"No H100 or A100-80 capacity is available right now: a machine could not be started for this workload after several attempts.": {
+			Reason: types.ContainerSchedulingFailureProvisioningLimit, Gpus: []string{"H100", "A100-80"}, WaitedSeconds: 600,
+		},
+	} {
+		require.Equal(t, message, SchedulingFailureMessage(failure))
+	}
+}
+
+// The status a gRPC handler answers with: capacity that was missing is
+// ResourceExhausted, and anything else stays as it was.
+func TestContainerNotScheduledErrorStatus(t *testing.T) {
+	noCapacity := &ContainerNotScheduledError{Failure: types.ContainerRequestFailure{
+		Reason: types.ContainerSchedulingFailureWorkerCapacityTimeout, Gpus: []string{"A10G"}, WaitedSeconds: 1200,
+	}}
+	st, ok := status.FromError(fmt.Errorf("stream ended: %w", noCapacity))
+	require.True(t, ok)
+	require.Equal(t, codes.ResourceExhausted, st.Code())
+	require.Contains(t, st.Message(), "No A10G capacity became available in 20 minutes.")
+
+	noController := &ContainerNotScheduledError{Failure: types.ContainerRequestFailure{
+		Reason: types.ContainerSchedulingFailureNoController, PoolSelector: "gone",
+	}}
+	require.Equal(t, codes.Unknown, status.Code(noController))
+	require.Equal(t, `The selected compute pool "gone" is unavailable or has no active controller.`, status.Convert(noController).Message())
 }

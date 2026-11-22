@@ -21,12 +21,31 @@ const (
 	workerAddressPollInterval = time.Second
 )
 
+// A stream that tells its client what its container waits for reads that
+// after pendingReadInterval, and then after twice as long each time, up to
+// maxPendingReadInterval. So a container that a worker takes at once costs no
+// read, and one that waits for a machine costs one every few seconds.
+//
+// The client is told each change, and what has not changed once more every
+// pendingRetellInterval: a client that hears nothing cannot tell how long it
+// has waited, or decide that it has waited long enough.
+//
+// Tests shorten these.
+var (
+	pendingReadInterval    = time.Second
+	maxPendingReadInterval = 5 * time.Second
+	pendingRetellInterval  = 10 * time.Second
+)
+
 // ErrWorkerUnreachable wraps a failure to connect to the worker running a container.
 var ErrWorkerUnreachable = errors.New("worker unreachable")
 
 type ContainerStreamOpts struct {
-	SendCallback    func(o common.OutputMsg) error
-	ExitCallback    func(exitCode int32) error
+	SendCallback func(o common.OutputMsg) error
+	ExitCallback func(exitCode int32) error
+	// PendingCallback is optional. It is told what the container waits for
+	// until a worker has it.
+	PendingCallback func(pending types.Pending) error
 	ContainerRepo   repository.ContainerRepository
 	Tailscale       *network.Tailscale
 	Config          types.AppConfig
@@ -38,6 +57,7 @@ func NewContainerStream(opts ContainerStreamOpts) (*ContainerStream, error) {
 	return &ContainerStream{
 		sendCallback:    opts.SendCallback,
 		exitCallback:    opts.ExitCallback,
+		pendingCallback: opts.PendingCallback,
 		containerRepo:   opts.ContainerRepo,
 		tailscale:       opts.Tailscale,
 		config:          opts.Config,
@@ -49,6 +69,7 @@ func NewContainerStream(opts ContainerStreamOpts) (*ContainerStream, error) {
 type ContainerStream struct {
 	sendCallback    func(o common.OutputMsg) error
 	exitCallback    func(exitCode int32) error
+	pendingCallback func(pending types.Pending) error
 	containerRepo   repository.ContainerRepository
 	tailscale       *network.Tailscale
 	config          types.AppConfig
@@ -77,7 +98,7 @@ func (l *ContainerStream) Stream(ctx context.Context, authInfo *auth.AuthInfo, c
 
 	clientResult := make(chan containerClientResult, 1)
 	go func() {
-		hostname, err := l.waitForWorkerAddress(ctx, containerId)
+		hostname, err := l.waitForWorker(ctx, containerId)
 		if err != nil {
 			clientResult <- containerClientResult{err: err}
 			return
@@ -96,6 +117,90 @@ func (l *ContainerStream) Stream(ctx context.Context, authInfo *auth.AuthInfo, c
 	return l.handleStreams(ctx, containerId, outputChan, keyEventChan, clientResult)
 }
 
+// notAssigned is how the wait ends for a container that will not get a
+// worker: with why the scheduler gave up on it, if it did.
+func (l *ContainerStream) notAssigned(containerID string) error {
+	if failure, err := l.containerRepo.GetContainerRequestFailure(containerID); err == nil && failure != nil {
+		return &ContainerNotScheduledError{Failure: *failure}
+	}
+	return fmt.Errorf("container stopped before it was assigned to a worker")
+}
+
+// waitForWorker waits until a worker has the container, and returns where to
+// reach it. A stream with a PendingCallback tells its client what the
+// container waits for meanwhile. It also stops waiting for a container that
+// is stopped before a worker has it, which waitForWorkerAddress goes on
+// waiting for until its repository gives up, minutes later.
+func (l *ContainerStream) waitForWorker(ctx context.Context, containerID string) (string, error) {
+	if l.pendingCallback == nil {
+		return l.waitForWorkerAddress(ctx, containerID)
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type answer struct {
+		hostname string
+		err      error
+	}
+	found := make(chan answer, 1)
+	go func() {
+		hostname, err := l.waitForWorkerAddress(ctx, containerID)
+		found <- answer{hostname, err}
+	}()
+
+	// told is what the client was told last, and toldAt when.
+	var told types.Pending
+	var toldAt time.Time
+	tell := func(pending types.Pending) error {
+		if pending.Phase == told.Phase && pending.Reason == told.Reason && time.Since(toldAt) < pendingRetellInterval {
+			return nil
+		}
+		told, toldAt = pending, time.Now()
+		return l.pendingCallback(pending)
+	}
+
+	readIn := pendingReadInterval
+	read := time.NewTimer(readIn)
+	defer read.Stop()
+	for {
+		select {
+		case a := <-found:
+			// A client that was told the container waits is told that a
+			// worker has it. From here the container's output says how it
+			// gets on.
+			if a.err == nil && told.Phase != "" {
+				starting := types.ContainerPendingStarting
+				if err := tell(types.Pending{Phase: starting, Message: starting.Message("")}); err != nil {
+					return "", err
+				}
+			}
+			return a.hostname, a.err
+		case <-read.C:
+			state, err := l.containerRepo.GetContainerState(containerID)
+			var notFound *types.ErrContainerStateNotFound
+			switch {
+			case errors.As(err, &notFound), err == nil && state.Status == types.ContainerStatusStopping:
+				// The container was stopped, or the scheduler gave up on it.
+				select {
+				case a := <-found:
+					return a.hostname, a.err
+				default:
+					return "", l.notAssigned(containerID)
+				}
+			case err == nil:
+				if pending := state.Pending(time.Now()); pending != nil {
+					if err := tell(*pending); err != nil {
+						return "", err
+					}
+				}
+			}
+			// A state that cannot be read says nothing.
+			readIn = min(2*readIn, maxPendingReadInterval)
+			read.Reset(readIn)
+		}
+	}
+}
+
 func (l *ContainerStream) waitForWorkerAddress(ctx context.Context, containerID string) (string, error) {
 	ticker := time.NewTicker(workerAddressPollInterval)
 	defer ticker.Stop()
@@ -108,7 +213,7 @@ func (l *ContainerStream) waitForWorkerAddress(ctx context.Context, containerID 
 
 		state, stateErr := l.containerRepo.GetContainerState(containerID)
 		if stateErr != nil || state == nil || state.Status == types.ContainerStatusStopping {
-			return "", fmt.Errorf("container stopped before it was assigned to a worker")
+			return "", l.notAssigned(containerID)
 		}
 
 		select {
