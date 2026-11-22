@@ -11,6 +11,7 @@ import (
 	"github.com/beam-cloud/beta9/pkg/common"
 	"github.com/beam-cloud/beta9/pkg/providers"
 	"github.com/beam-cloud/beta9/pkg/types"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -46,7 +47,10 @@ type ReaderOptions struct {
 	Providers *providers.Registry
 	Redis     *common.RedisClient
 	// Log holds the history. Nil means none is kept.
-	Log    Log
+	Log Log
+	// Charts keeps the charts every gateway answers alike. Nil means each
+	// gateway works out its own.
+	Charts ChartCache
 	Config types.ProviderMarketConfig
 	// Sells reports whether tenants can reserve machines of a provider. Only
 	// those are shown to them. Nil means every provider.
@@ -76,6 +80,13 @@ type Reader struct {
 
 	mu     sync.Mutex
 	cached map[string]cachedAnswer
+
+	charts  ChartCache
+	flights singleflight.Group
+	// warming is held while charts are worked out anew, and warmed is when
+	// each range's last were.
+	warming sync.Mutex
+	warmed  map[string]time.Time
 }
 
 type cachedAnswer struct {
@@ -101,6 +112,8 @@ func NewReader(opts ReaderOptions) *Reader {
 		bill:      bill,
 		clock:     common.ClockOrReal(opts.Clock),
 		cached:    map[string]cachedAnswer{},
+		charts:    opts.Charts,
+		warmed:    map[string]time.Time{},
 	}
 }
 

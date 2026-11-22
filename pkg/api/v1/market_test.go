@@ -156,6 +156,47 @@ func TestTheMarketsHistoryIsAskedForInTheQuery(t *testing.T) {
 	assert.Equal(t, []string{}, keys(asTenant, "geo=eu-north,eu-west"))
 	assert.Equal(t, []string{"aws", "shadeform"}, keys(asAdmin, "group=provider&raw=true"))
 	assert.Equal(t, []string{"lambda"}, keys(asAdmin, "group=cloud&provider=shadeform"))
+
+	status, body = askMarket(t, group.Series, asTenant, "range=1h")
+	require.Equal(t, http.StatusOK, status, body)
+	assert.Contains(t, body, `"range":"1h"`)
+	assert.Contains(t, body, `{"key":"A10G","gpu":"A10G","points":[[`+start+`,418000,`)
+
+	status, body = askMarket(t, group.Outcomes, asTenant, "range=7d&pricing=spot")
+	require.Equal(t, http.StatusOK, status, body)
+	assert.Contains(t, body, `"cols":["ts","boot_p50","boot_p90","preempted_share","preempted_after_p50"]`)
+}
+
+func TestAnyoneMayAskForTheMarketsChartsByRangeAndPricing(t *testing.T) {
+	e := echo.New()
+	NewPublicMarketGroup(e.Group("/api/v1/market/public"), newMarketGroup(t, true).reader)
+	ask := func(path string) (int, string) {
+		recorder := httptest.NewRecorder()
+		e.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if recorder.Code == http.StatusOK {
+			assert.Equal(t, "public, max-age=30", recorder.Header().Get("Cache-Control"), path)
+		}
+		return recorder.Code, recorder.Body.String()
+	}
+
+	status, body := ask("/api/v1/market/public/now")
+	require.Equal(t, http.StatusOK, status, body)
+	assert.Contains(t, body, `"admin":false`)
+	assert.NotContains(t, body, "shadeform")
+
+	status, body = ask("/api/v1/market/public/series?range=1h&pricing=on_demand&gpu=H100&group=provider&raw=true")
+	require.Equal(t, http.StatusOK, status, body)
+	assert.Contains(t, body, `"range":"1h"`)
+	assert.Contains(t, body, `{"key":"A10G","gpu":"A10G","points":[[`+strconv.FormatInt(marketNoon.UnixMilli(), 10)+`,1100000,`,
+		"what else is asked is not read: a tenant's price of every GPU type")
+
+	status, body = ask("/api/v1/market/public/outcomes")
+	require.Equal(t, http.StatusOK, status, body)
+	assert.Contains(t, body, `"range":"24h"`)
+
+	status, body = ask("/api/v1/market/public/series?range=2d")
+	assert.Equal(t, http.StatusBadRequest, status)
+	assert.Contains(t, body, "range must be one of")
 }
 
 func TestAQuestionTheMarketCannotAnswerIsRefusedWithWhy(t *testing.T) {
@@ -166,7 +207,7 @@ func TestAQuestionTheMarketCannotAnswerIsRefusedWithWhy(t *testing.T) {
 		status int
 		why    string
 	}{
-		"":                              {asTenant, http.StatusBadRequest, "gpu is required"},
+		"range=2d":                      {asTenant, http.StatusBadRequest, `range must be one of 1h, 6h, 24h, 7d, 30d, 90d, not \"2d\"`},
 		"gpu=A10G&pricing=cheap":        {asTenant, http.StatusBadRequest, `pricing must be on_demand, spot or any, not \"cheap\"`},
 		"gpu=A10G&gpu_count=two":        {asTenant, http.StatusBadRequest, `gpu_count must be whole numbers, not \"two\"`},
 		"gpu=A10G&start=yesterday":      {asTenant, http.StatusBadRequest, `start must be a time as RFC 3339 or in milliseconds, not \"yesterday\"`},
@@ -199,9 +240,15 @@ func TestWithoutAHistoryTheMarketStillTellsWhatIsForSale(t *testing.T) {
 func TestAClusterThatDoesNotSampleTheMarketSaysSo(t *testing.T) {
 	group := NewMarketGroup(echo.New().Group("/api/v1/market"), nil)
 
-	for _, handler := range []echo.HandlerFunc{group.Now, group.Series} {
+	for _, handler := range []echo.HandlerFunc{group.Now, group.Series, group.Outcomes} {
 		status, body := askMarket(t, handler, asTenant, "gpu=A10G")
 		assert.Equal(t, http.StatusServiceUnavailable, status)
 		assert.Contains(t, body, "not sampled")
 	}
+
+	e := echo.New()
+	NewPublicMarketGroup(e.Group("/api/v1/market/public"), nil)
+	recorder := httptest.NewRecorder()
+	e.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/market/public/series", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, recorder.Code)
 }

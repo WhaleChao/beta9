@@ -459,11 +459,10 @@ func TestAQuestionThatCannotBeAnsweredSaysWhatIsWrongWithIt(t *testing.T) {
 	reader := market.reader()
 
 	for what, q := range map[string]SeriesRequest{
-		"gpu is required": {},
-		`pricing must be on_demand, spot or any, not "cheap"`:   {GPU: "A10G", Pricing: "cheap"},
-		`group must be of pricing, geo and gpus, not "weather"`: {GPU: "A10G", Group: []string{"weather"}},
-		"end must be after start":                               {GPU: "A10G", Start: noon, End: noon.Add(-time.Hour)},
-		"the time asked about must be two years or less":        {GPU: "A10G", Start: noon.Add(-3 * 366 * 24 * time.Hour)},
+		`pricing must be on_demand, spot or any, not "cheap"`:        {GPU: "A10G", Pricing: "cheap"},
+		`group must be of gpu, pricing, geo and gpus, not "weather"`: {GPU: "A10G", Group: []string{"weather"}},
+		"end must be after start":                                    {GPU: "A10G", Start: noon, End: noon.Add(-time.Hour)},
+		"the time asked about must be two years or less":             {GPU: "A10G", Start: noon.Add(-3 * 366 * 24 * time.Hour)},
 	} {
 		_, err := reader.Series(context.Background(), q)
 		var wrong *RequestError

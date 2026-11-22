@@ -64,6 +64,7 @@ func newProviderMarket(config types.AppConfig, registry *providers.Registry, red
 			Providers: registry,
 			Redis:     redisClient,
 			Log:       history,
+			Charts:    repository.NewMarketChartRedisRepository(redisClient),
 			Config:    sampled,
 			Sells:     func(provider string) bool { return slices.Contains(reserved, provider) },
 			Bill:      func(micros int64) int64 { return computesvc.BillableMicros(config.ManagedCompute, micros) },
@@ -86,5 +87,6 @@ func (m providerMarket) start(ctx context.Context) {
 		return
 	}
 	m.outcomes.Start(ctx)
+	m.sampler.OnSampled(func() { go m.reader.Warm(ctx) })
 	m.sampler.Start(ctx)
 }

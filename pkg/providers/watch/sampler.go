@@ -95,7 +95,13 @@ type Sampler struct {
 	// placed are the GPU types this gateway knows to have a place among
 	// the hours that are put together.
 	placed map[string]bool
+
+	sampled func()
 }
+
+// OnSampled calls fn after each sample this gateway writes to the history.
+// It is set before the sampler starts.
+func (s *Sampler) OnSampled(fn func()) { s.sampled = fn }
 
 // writtenSnapshot is the offers of a provider that were last written in
 // full, and when.
@@ -272,6 +278,9 @@ func (s *Sampler) Sample(ctx context.Context, at time.Time) {
 	}
 	s.write(ctx, writes)
 	s.rollUp(ctx, at, samples)
+	if s.sampled != nil {
+		s.sampled()
+	}
 }
 
 // ask asks every provider at once. A provider that does not answer in time

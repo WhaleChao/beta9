@@ -393,6 +393,7 @@ func (g *Gateway) initHttp() error {
 	apiv1.NewAppGroup(g.baseRouteGroup.Group("/app", authMiddleware), g.BackendRepo, g.Config, g.ContainerRepo, *g.Scheduler, g.RedisClient)
 	apiv1.NewPoolGroup(g.baseRouteGroup.Group("/pools", authMiddleware), g.ComputeService)
 	apiv1.NewMarketGroup(g.baseRouteGroup.Group("/market", authMiddleware), g.market.reader)
+	apiv1.NewPublicMarketGroup(g.baseRouteGroup.Group("/market/public"), g.market.reader)
 
 	return nil
 }

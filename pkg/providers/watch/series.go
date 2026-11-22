@@ -4,10 +4,12 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"maps"
 	"math"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -29,6 +31,9 @@ const (
 	minuteChunk     = 6 * time.Hour
 	hourChunk       = 30 * 24 * time.Hour
 	readConcurrency = 6
+	// gpusAtOnce is how many GPU types' histories are read at a time for a
+	// chart of all of them.
+	gpusAtOnce = 4
 )
 
 var (
@@ -38,6 +43,7 @@ var (
 
 // What a chart's series can be told apart by.
 const (
+	ByGPU      = "gpu"
 	ByPricing  = "pricing"
 	ByGeo      = "geo"
 	ByGPUs     = "gpus"
@@ -48,15 +54,20 @@ const (
 
 // SeriesRequest asks what a GPU type sold for over a time.
 type SeriesRequest struct {
+	// GPU is the GPU type asked about. Empty means every one on record,
+	// each told apart from the others.
 	GPU string
 	// What to leave out. Empty means nothing.
 	Counts  []uint32
 	Geos    []string
 	Pricing string
 	// Group is what the series are told apart by. Nil means by how the
-	// machine is sold.
+	// machine is sold, or by GPU type for every one of them.
 	Group []string
-	// Start and End are the time asked about. Zero means the last day.
+	// Range names a time that ends now, of Ranges, in place of Start and
+	// End. Otherwise Start and End are the time asked about; zero means the
+	// last day.
+	Range      string
 	Start, End time.Time
 
 	// Admin says that a cluster admin asks. The rest is for admins only.
@@ -71,6 +82,7 @@ type SeriesRequest struct {
 // SeriesAnswer is a chart of what a GPU type sold for.
 type SeriesAnswer struct {
 	GPU   string    `json:"gpu"`
+	Range string    `json:"range,omitempty"`
 	Start time.Time `json:"start"`
 	End   time.Time `json:"end"`
 	// Tier is what the chart was drawn from: the samples, or the hours.
@@ -105,6 +117,7 @@ var PointColumns = []string{"ts", "price", "low", "high", "stock", "in_stock", "
 // Series is one line of a chart, and what it is of.
 type Series struct {
 	Key      string  `json:"key"`
+	GPU      string  `json:"gpu,omitempty"`
 	Pricing  string  `json:"pricing,omitempty"`
 	Geo      string  `json:"geo,omitempty"`
 	GPUs     uint32  `json:"gpus,omitempty"`
@@ -118,9 +131,6 @@ type Series struct {
 
 func (q *SeriesRequest) normalize(now time.Time) error {
 	q.GPU = strings.TrimSpace(q.GPU)
-	if q.GPU == "" {
-		return badRequest("gpu is required")
-	}
 	switch q.Pricing {
 	case "", PricingAny:
 		q.Pricing = PricingAny
@@ -128,22 +138,40 @@ func (q *SeriesRequest) normalize(now time.Time) error {
 	default:
 		return badRequest("pricing must be on_demand, spot or any, not %q", q.Pricing)
 	}
-	if q.Group == nil {
+	switch {
+	case q.Group != nil:
+	case q.GPU == "":
+		q.Group = []string{ByGPU}
+	default:
 		q.Group = []string{ByPricing}
 	}
 	for _, by := range q.Group {
 		switch by {
-		case ByPricing, ByGeo, ByGPUs:
+		case ByGPU, ByPricing, ByGeo, ByGPUs:
 		case ByProvider, ByCloud, ByRegion:
 			if !q.Admin {
 				return ErrAdminOnly
 			}
 		default:
-			return badRequest("group must be of pricing, geo and gpus, not %q", by)
+			return badRequest("group must be of gpu, pricing, geo and gpus, not %q", by)
 		}
+	}
+	// What different GPU types sold for is never one series.
+	if q.GPU == "" && !slices.Contains(q.Group, ByGPU) {
+		q.Group = append([]string{ByGPU}, q.Group...)
 	}
 	if !q.Admin && (len(q.Providers) > 0 || len(q.Clouds) > 0 || len(q.Regions) > 0 || q.Raw) {
 		return ErrAdminOnly
+	}
+	if q.Range != "" {
+		rng, ok := rangeOf(q.Range)
+		switch {
+		case !ok:
+			return badRequest("range must be one of %s, not %q", rangeNames(), q.Range)
+		case !q.Start.IsZero() || !q.End.IsZero():
+			return badRequest("range is asked in place of start and end, not with them")
+		}
+		q.Start, q.End = now.Add(-rng.Span), now
 	}
 	if q.End.IsZero() {
 		q.End = now
@@ -168,8 +196,8 @@ func (q *SeriesRequest) normalize(now time.Time) error {
 // minute, whatever the step: a time that ends earlier in a step has a
 // different last point than one that ends later in it.
 func (q SeriesRequest) cacheKey(step time.Duration) string {
-	return fmt.Sprintf("series:%s|%v|%v|%s|%v|%d|%d|%t|%v|%v|%v|%t",
-		q.GPU, q.Counts, q.Geos, q.Pricing, q.Group,
+	return fmt.Sprintf("series:%s|%v|%v|%s|%v|%s|%d|%d|%t|%v|%v|%v|%t",
+		q.GPU, q.Counts, q.Geos, q.Pricing, q.Group, q.Range,
 		q.Start.Truncate(step).Unix(), q.End.Truncate(time.Minute).Unix(),
 		q.Admin, q.Providers, q.Clouds, q.Regions, q.Raw)
 }
@@ -187,13 +215,16 @@ func (q SeriesRequest) wants(listing Listing) bool {
 	return true
 }
 
-// seriesOf is the series a listing belongs to: what the series are told
-// apart by, and nothing else of the listing.
-func (q SeriesRequest) seriesOf(listing Listing) Series {
+// seriesOf is the series a listing of a GPU type belongs to: what the
+// series are told apart by, and nothing else of the listing.
+func (q SeriesRequest) seriesOf(gpu string, listing Listing) Series {
 	var series Series
 	parts := make([]string, 0, len(q.Group))
 	for _, by := range q.Group {
 		switch by {
+		case ByGPU:
+			series.GPU = gpu
+			parts = append(parts, gpu)
 		case ByPricing:
 			series.Pricing = pricingOf(listing.Spot)
 			parts = append(parts, series.Pricing)
@@ -257,8 +288,30 @@ func (r *Reader) Series(ctx context.Context, q SeriesRequest) (*SeriesAnswer, er
 	}
 	tier, step := r.tierOf(q, now)
 	return cache(r, q.cacheKey(step), seriesCachedFor, func() (*SeriesAnswer, error) {
-		return r.series(ctx, q, tier, step, now)
+		return shared(ctx, r, "series", q, func(ctx context.Context) (*SeriesAnswer, error) {
+			return r.series(ctx, q, tier, step, now)
+		})
 	})
+}
+
+// gpusOf is the GPU types a question asks about: the one it names, or
+// every one that has been for sale within seenFor by a provider the asker
+// may see.
+func (r *Reader) gpusOf(ctx context.Context, q SeriesRequest, now time.Time) ([]string, error) {
+	if q.GPU != "" {
+		return []string{q.GPU}, nil
+	}
+	seen, err := r.shared.Seen(ctx, now)
+	if err != nil {
+		return nil, fmt.Errorf("read what has been for sale: %w", err)
+	}
+	gpus := map[string]bool{}
+	for _, was := range seen {
+		if q.Admin || r.sells(was.Provider) {
+			gpus[was.GPU] = true
+		}
+	}
+	return slices.Sorted(maps.Keys(gpus)), nil
 }
 
 // seen is what a series comes to at one time of the record: a sample, or an
@@ -287,32 +340,40 @@ type line struct {
 
 func (r *Reader) series(ctx context.Context, q SeriesRequest, tier Tier, step time.Duration, now time.Time) (*SeriesAnswer, error) {
 	out := &SeriesAnswer{
-		GPU: q.GPU, Start: q.Start, End: q.End, Tier: tier, StepSeconds: int(step.Seconds()),
+		GPU: q.GPU, Range: q.Range, Start: q.Start, End: q.End, Tier: tier, StepSeconds: int(step.Seconds()),
 		Raw: q.Raw, Cols: PointColumns, Series: []Series{},
 	}
-	wants := func(listing Listing) bool {
-		return q.wants(listing) && (q.Admin || r.sells(listing.Provider))
+	gpus, err := r.gpusOf(ctx, q, now)
+	if err != nil {
+		return nil, err
 	}
 
-	var lines map[string]*line
-	var polls map[string]PollHour
-	var err error
-	// The first step holds the start asked for.
-	from := q.Start.Truncate(step)
-	switch tier {
-	case TierMinute:
-		var samples []Sample
-		if samples, err = r.samples(ctx, q.GPU, from, q.End); err == nil {
-			lines, polls = linesOfSamples(q, wants, samples)
-		}
-	default:
-		var hours []Hourly
-		if hours, err = r.hours(ctx, q.GPU, from, q.End, now); err == nil {
-			lines, polls = linesOfHours(q, wants, hours)
-		}
+	lines := map[string]*line{}
+	polls := map[string]PollHour{}
+	var mu sync.Mutex
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(gpusAtOnce)
+	for _, gpu := range gpus {
+		group.Go(func() error {
+			found, tally, err := r.linesOf(groupCtx, q, gpu, tier, step, now)
+			if err != nil {
+				return fmt.Errorf("read the market's history of %s: %w", gpu, err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			maps.Copy(lines, found)
+			// Every GPU type is sampled from the same polls, and one first
+			// sampled within the time from fewer of them.
+			for provider, poll := range tally {
+				if poll.Polls > polls[provider].Polls {
+					polls[provider] = poll
+				}
+			}
+			return nil
+		})
 	}
-	if err != nil {
-		return nil, fmt.Errorf("read the market's history of %s: %w", q.GPU, err)
+	if err := group.Wait(); err != nil {
+		return nil, err
 	}
 	if q.Admin {
 		out.Providers = polls
@@ -338,6 +399,30 @@ func (r *Reader) series(ctx context.Context, q SeriesRequest, tier Tier, step ti
 		out.Series, out.Truncated = out.Series[:seriesAtMost], true
 	}
 	return out, nil
+}
+
+// linesOf reads the lines of a GPU type that a question asks for, and how
+// the providers answered over the time.
+func (r *Reader) linesOf(ctx context.Context, q SeriesRequest, gpu string, tier Tier, step time.Duration, now time.Time) (map[string]*line, map[string]PollHour, error) {
+	wants := func(listing Listing) bool {
+		return q.wants(listing) && (q.Admin || r.sells(listing.Provider))
+	}
+	// The first step holds the start asked for.
+	from := q.Start.Truncate(step)
+	if tier == TierMinute {
+		samples, err := r.samples(ctx, gpu, from, q.End)
+		if err != nil {
+			return nil, nil, err
+		}
+		lines, polls := linesOfSamples(q, wants, samples)
+		return lines, polls, nil
+	}
+	hours, err := r.hours(ctx, gpu, from, q.End, now)
+	if err != nil {
+		return nil, nil, err
+	}
+	lines, polls := linesOfHours(q, wants, hours)
+	return lines, polls, nil
 }
 
 // samples reads the samples of a time, several parts of it at once.
@@ -439,7 +524,7 @@ func linesOfSamples(q SeriesRequest, wants func(Listing) bool, samples []Sample)
 			if !wants(row.Listing) {
 				continue
 			}
-			series := q.seriesOf(row.Listing)
+			series := q.seriesOf(sample.GPU, row.Listing)
 			at, ok := lines[series.Key]
 			if !ok {
 				at = &line{series: series, providers: map[string]bool{}}
@@ -524,7 +609,7 @@ func linesOfHours(q SeriesRequest, wants func(Listing) bool, hours []Hourly) (ma
 			if !wants(row.Listing) {
 				continue
 			}
-			series := q.seriesOf(row.Listing)
+			series := q.seriesOf(hour.GPU, row.Listing)
 			if _, ok := lines[series.Key]; !ok {
 				lines[series.Key] = &line{series: series, providers: map[string]bool{}}
 				at[series.Key] = make([]*sums, len(hours))

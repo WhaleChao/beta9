@@ -156,6 +156,7 @@ var (
 	marketTick        string = "market:tick:%d"
 	marketSeen        string = "market:seen"
 	marketRollups     string = "market:rollups"
+	marketChart       string = "market:chart:%s"
 )
 
 var (
@@ -521,6 +522,11 @@ func (rk *redisKeys) MarketSeen() string {
 // MarketRollups holds the last hour whose samples were put together, by GPU.
 func (rk *redisKeys) MarketRollups() string {
 	return marketRollups
+}
+
+// MarketChart holds a chart of the market that every gateway answers alike.
+func (rk *redisKeys) MarketChart(name string) string {
+	return fmt.Sprintf(marketChart, name)
 }
 
 // ComputeProvisionedMachines holds the record of every machine bought for a
