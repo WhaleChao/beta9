@@ -23,6 +23,20 @@ ARG COMPOSE_SHA256_ARM64=4d0f7678dd3338452beba4518e36a8e22b20cad79ba2535c687da55
 ARG YQ_VERSION=4.54.3
 ARG YQ_SHA256_AMD64=129534601871538efe0ba4c5e62a34fb1d5f469bcb975c4fddeb467d82974973
 ARG YQ_SHA256_ARM64=89f69310b61b68d1245065a1241d1fc843f7a36cd6103ffd77ad987613bd1b67
+# The AWS CLI, Helm and Yarn in the versions GitHub's image has
+# (Ubuntu2404-Readme.md). AWS publishes signatures rather than checksums: these
+# are of archives that verify against its key.
+# https://raw.githubusercontent.com/aws/aws-cli/v2/CHANGELOG.rst
+ARG AWSCLI_VERSION=2.40.0
+ARG AWSCLI_SHA256_AMD64=4a6d34150060a6bc30160ef1f66e536db64674797bbb582044f93bb9c6e299e7
+ARG AWSCLI_SHA256_ARM64=d293743e9e79dc69dc79dcbc23e26d1258193f0dd1253ba0c09ccf56b6123c6e
+# https://github.com/helm/helm/releases
+ARG HELM_VERSION=3.22.1
+ARG HELM_SHA256_AMD64=896cf63684a42a723d61c980369d6e588330927deb13676ca0d85006dd6da0ea
+ARG HELM_SHA256_ARM64=4c29e286b279d170fa048ddfc3e4e83dcd069ca9c52102766ba672d7149e694d
+# https://github.com/yarnpkg/yarn/releases
+ARG YARN_VERSION=1.22.22
+ARG YARN_SHA256=88268464199d1611fcf73ce9c0a6c4d44c7d5363682720d8506f6508addf36a0
 # PostgreSQL and pipx as GitHub pins them (postgresql in
 # toolsets/toolset-2404.json, pipx in scripts/build/install-python.sh).
 ARG POSTGRESQL_VERSION=16
@@ -39,8 +53,8 @@ COPY apt.conf /etc/apt/apt.conf.d/90github-runner
 #   that manage a machine.
 # - The apt packages GitHub installs before any toolchain (vital_packages,
 #   common_packages and cmd_packages in toolsets/toolset-2404.json).
-# - Its compilers, the system Python's pip, venv and headers, GitHub CLI, Git LFS
-#   and kmod, which has modprobe.
+# - Its compilers, the system Python's pip, venv and headers, Ruby, GitHub CLI,
+#   Git LFS and kmod, which has modprobe.
 # - Docker. The VM build installs the newest release only where there is none.
 # The package indexes stay, for a job that installs without updating them.
 RUN apt-get update \
@@ -67,7 +81,7 @@ RUN apt-get update \
         mediainfo netcat-openbsd net-tools p7zip-full parallel patchelf pigz pollinate rsync shellcheck \
         sphinxsearch sqlite3 ssh sshpass sudo systemd-coredump swig telnet time zip \
         \
-        build-essential gh git-lfs kmod python3-dev python3-pip python3-venv zstd \
+        build-essential gh git-lfs kmod python3-dev python3-pip python3-venv ruby-full zstd \
         \
         containerd.io docker-buildx-plugin \
         "docker-ce-cli=5:$DOCKER_VERSION-1~ubuntu.24.04~noble" "docker-ce=5:$DOCKER_VERSION-1~ubuntu.24.04~noble" \
@@ -145,6 +159,29 @@ RUN curl -fsSL -o /etc/apt/keyrings/pgdg.asc https://www.postgresql.org/media/ke
 COPY pip.conf /etc/pip.conf
 RUN python3 -m pip install --no-cache-dir "pipx==$PIPX_VERSION" \
     && pipx --version
+
+# The AWS CLI, Helm and Yarn, which a release or deploy job calls without a
+# step that installs them (scripts/build/install-aws-tools.sh,
+# install-kubernetes-tools.sh and install-nodejs.sh). Yarn runs on the Node.js
+# that the VM build adds.
+RUN case "$(dpkg --print-architecture)" in \
+        amd64) awscli=$AWSCLI_SHA256_AMD64 helm=$HELM_SHA256_AMD64 ;; \
+        arm64) awscli=$AWSCLI_SHA256_ARM64 helm=$HELM_SHA256_ARM64 ;; \
+    esac \
+    && cd /tmp \
+    && curl -fsSL --retry 3 -o awscli.zip "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m)-$AWSCLI_VERSION.zip" \
+    && curl -fsSL --retry 3 -o helm.tgz "https://get.helm.sh/helm-v$HELM_VERSION-linux-$(dpkg --print-architecture).tar.gz" \
+    && curl -fsSL --retry 3 -o yarn.tgz "https://github.com/yarnpkg/yarn/releases/download/v$YARN_VERSION/yarn-v$YARN_VERSION.tar.gz" \
+    && printf '%s  %s\n' "$awscli" awscli.zip "$helm" helm.tgz "$YARN_SHA256" yarn.tgz | sha256sum --check - \
+    && unzip -q awscli.zip \
+    && ./aws/install --install-dir /usr/local/aws-cli --bin-dir /usr/local/bin \
+    && tar -xzf helm.tgz --strip-components=1 -C /usr/local/bin "linux-$(dpkg --print-architecture)/helm" \
+    && tar -xzf yarn.tgz -C /usr/local/lib \
+    && ln -s "/usr/local/lib/yarn-v$YARN_VERSION/bin/yarn" /usr/local/bin/yarn \
+    && ln -s yarn /usr/local/bin/yarnpkg \
+    && rm -r awscli.zip aws helm.tgz yarn.tgz \
+    && aws --version \
+    && helm version --short
 
 # What every process of a job starts with, and the limits it runs under
 # (scripts/build/configure-environment.sh and configure-limits.sh).
