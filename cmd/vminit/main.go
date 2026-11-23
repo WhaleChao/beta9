@@ -788,7 +788,9 @@ type control struct {
 	file    *os.File
 	enc     *microvm.Encoder
 	// Private loopback aliases retain interface-bound sockets across restore.
-	networkAliases  map[string]bool
+	// Each is numbered by the restore that retired it: a later one is higher.
+	networkAliases  map[string]int
+	networkRestores int
 	networkMu       sync.Mutex
 	restoredNetwork *restoredSocketNetwork
 	// What the host had connected when the guest was last frozen; those of

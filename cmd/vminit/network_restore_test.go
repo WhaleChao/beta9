@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"syscall"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/beam-cloud/beta9/pkg/runtime/microvm"
+	"github.com/coreos/go-iptables/iptables"
 	"github.com/vishvananda/netlink"
 )
 
@@ -117,6 +119,43 @@ func TestResetRules(t *testing.T) {
 		if got := resetRules(test.installed, test.stale); got != test.want {
 			t.Errorf("%s:\n%s\nwant:\n%s", test.name, got, test.want)
 		}
+	}
+}
+
+// A desktop's media server listens on every address it finds, so on each one
+// the guest had before. That must choose a listener, and not fail the restore.
+func TestSharedPortGoesToLatestRetainedAddress(t *testing.T) {
+	dir := t.TempDir()
+	applied := filepath.Join(dir, "applied")
+	for name, script := range map[string]string{"iptables-save": "", "iptables-restore": "cat > " + applied + "\n"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"+script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	// The latest is neither first nor last by name.
+	control := &control{networkAliases: map[string]int{"192.168.0.10": 1, "192.168.0.9": 2, "192.168.0.11": 3}}
+	listeners := map[string][]int{
+		"192.168.0.10": {7000, 8000, 8443},
+		"192.168.0.9":  {7000, 8443, 9000},
+		"192.168.0.11": {8443, 9000},
+		"192.168.0.12": {9000}, // listened on again at the current address
+	}
+	if err := control.restoreSocketRules(iptables.ProtocolIPv4, net.ParseIP("192.168.0.12"), "eth0", listeners); err != nil {
+		t.Fatal(err)
+	}
+	rules, err := os.ReadFile(applied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, rule := range strings.Split(string(rules), "\n") {
+		if _, to, ok := strings.Cut(rule, " -j DNAT --to-destination "); ok {
+			got = append(got, to)
+		}
+	}
+	if want := []string{"192.168.0.9:7000", "192.168.0.10:8000", "192.168.0.11:8443"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("translated to %v, want %v:\n%s", got, want, rules)
 	}
 }
 

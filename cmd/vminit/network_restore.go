@@ -67,12 +67,13 @@ func (c *control) restoreNetworkLink(cfg microvm.Network, link netlink.Link) err
 	}
 
 	if c.networkAliases == nil {
-		c.networkAliases = map[string]bool{}
+		c.networkAliases = map[string]int{}
 	}
 
+	c.networkRestores++
 	for _, addr := range previous {
 		if addr.Scope != int(netlink.SCOPE_LINK) {
-			c.networkAliases[addr.IP.String()] = true
+			c.networkAliases[addr.IP.String()] = c.networkRestores
 		}
 	}
 
@@ -99,7 +100,7 @@ func (c *control) restoreNetworkLink(cfg microvm.Network, link netlink.Link) err
 		}
 
 		current[family] = ip
-		if c.networkAliases[ip.String()] {
+		if c.networkAliases[ip.String()] > 0 {
 			// An address may cycle back to this VM after several suspensions.
 			_ = netlink.AddrDel(lo, &netlink.Addr{IPNet: &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}})
 			delete(c.networkAliases, ip.String())
@@ -296,10 +297,11 @@ func (c *control) restoreSocketRules(family iptables.Protocol, current net.IP, n
 	ports := map[int]string{}
 	for _, address := range aliases {
 		for _, port := range listeners[address] {
-			if previous := ports[port]; previous != "" && previous != address {
-				return fmt.Errorf("multiple paused interfaces listen on TCP port %d", port)
+			// Several of them may listen on a port, as a server that binds
+			// each address it finds does. The one the guest had last takes it.
+			if c.networkAliases[ports[port]] <= c.networkAliases[address] {
+				ports[port] = address
 			}
-			ports[port] = address
 		}
 	}
 	for _, port := range listeners[current.String()] {
