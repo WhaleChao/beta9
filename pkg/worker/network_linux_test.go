@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -139,4 +140,41 @@ func TestSetupRemovesItsNetworkWhenItFails(t *testing.T) {
 			require.NoFileExists(t, filepath.Join(types.HostNetnsPath, containerId))
 		})
 	}
+}
+
+// A command in a build network resolves with the build's resolv.conf, or does
+// not run. Its arguments reach it as given, and the worker's own resolv.conf
+// is the same before and after.
+func TestBuildNetworkResolvConfIsTheCommandsOwn(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("entering namespaces and mounting require root")
+	}
+	workers, err := os.ReadFile(hostResolvConfPath)
+	require.NoError(t, err)
+	resolvConf := filepath.Join(t.TempDir(), "resolv.conf")
+	require.NoError(t, os.WriteFile(resolvConf, []byte("nameserver 192.0.2.53\n"), 0o644))
+
+	run := func(network buildNetwork, command ...string) (string, error) {
+		argv := append(network.enter("pull"), command...)
+		output, err := exec.Command(argv[0], argv[1:]...).CombinedOutput()
+		return string(output), err
+	}
+
+	network := buildNetwork{netnsPath: "/proc/self/ns/net", resolvConf: resolvConf}
+	output, err := run(network, "cat", hostResolvConfPath)
+	require.NoError(t, err, output)
+	require.Equal(t, "nameserver 192.0.2.53\n", output)
+
+	output, err = run(network, "printf", "%s\n", "$(id)", "a; b")
+	require.NoError(t, err, output)
+	require.Equal(t, "$(id)\na; b\n", output)
+
+	network.resolvConf = filepath.Join(t.TempDir(), "missing")
+	output, err = run(network, "echo", "ran")
+	require.Error(t, err)
+	require.NotContains(t, output, "ran")
+
+	after, err := os.ReadFile(hostResolvConfPath)
+	require.NoError(t, err)
+	require.Equal(t, string(workers), string(after))
 }

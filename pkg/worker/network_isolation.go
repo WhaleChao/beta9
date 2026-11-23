@@ -242,17 +242,55 @@ func endpointHostPort(target string) (string, int) {
 	return u.Hostname(), 443
 }
 
-// buildNetwork gives an image build a namespace behind the container bridge,
-// so buildah's own fetches, such as FROM and ADD URLs, are isolated like its
-// RUN steps.
-func (m *ContainerNetworkManager) buildNetwork() (string, func(), error) {
+// buildNetwork is where an image build runs buildah: a network namespace
+// behind the container bridge, so buildah's own fetches, such as FROM and ADD
+// URLs, are isolated like its RUN steps.
+type buildNetwork struct {
+	netnsPath string
+
+	// resolvConf replaces the worker's resolv.conf for buildah. Empty when
+	// the worker's own works in the namespace.
+	resolvConf string
+}
+
+// newBuildNetwork gives an image build a network, and returns its release.
+func (m *ContainerNetworkManager) newBuildNetwork() (buildNetwork, func(), error) {
 	slot, err := m.createNetworkSlot()
 	if err != nil {
-		return "", nil, fmt.Errorf("create build network: %w", err)
+		return buildNetwork{}, nil, fmt.Errorf("create build network: %w", err)
 	}
-	return slot.netnsPath, func() {
+
+	network := buildNetwork{netnsPath: slot.netnsPath, resolvConf: buildResolvConf(hostResolvConfPath)}
+	return network, func() {
 		if err := m.releaseUnusedNetworkSlot(slot); err != nil {
 			log.Warn().Err(err).Str("network_slot", slot.id).Msg("failed to release build network")
 		}
 	}, nil
+}
+
+// buildResolvConf returns the resolv.conf a build network needs in place of
+// the worker's own, at hostPath: the one containers fall back to, when the
+// worker's names only loopback resolvers. A worker on its host's network
+// inherits systemd-resolved's stub on 127.0.0.53, and a build's namespace has
+// a loopback of its own with nothing listening on it.
+func buildResolvConf(hostPath string) string {
+	if resolvConfHasUsableNameserver(hostPath) {
+		return ""
+	}
+	return workerResolvConfPath
+}
+
+// bindResolvConf mounts $0 as /etc/resolv.conf, then runs the command in $@.
+const bindResolvConf = `mount --bind "$0" /etc/resolv.conf && exec "$@"`
+
+// enter returns the command prefix that runs a buildah sub command in the
+// network. A resolv.conf is mounted in a mount namespace of the command's own,
+// so the worker keeps its resolver. mount and umount stay in the worker's
+// mount namespace: they resolve nothing, and the worker reads what they mount.
+func (n buildNetwork) enter(sub string) []string {
+	prefix := []string{"nsenter", "--net=" + n.netnsPath, "--"}
+	if n.resolvConf == "" || sub == "mount" || sub == "umount" {
+		return prefix
+	}
+	return append(prefix, "unshare", "--mount", "--propagation", "private", "--", "sh", "-c", bindResolvConf, n.resolvConf)
 }

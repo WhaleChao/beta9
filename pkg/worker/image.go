@@ -165,9 +165,9 @@ type ImageClient struct {
 	workerId           string
 	workerPoolName     string
 	workerRepoClient   pb.WorkerRepositoryServiceClient
-	// buildNetwork returns the network namespace an image build runs buildah
-	// in, and its release.
-	buildNetwork     func() (string, func(), error)
+	// newBuildNetwork returns the network an image build runs buildah in, and
+	// its release.
+	newBuildNetwork  func() (buildNetwork, func(), error)
 	logger           *ContainerLogger
 	eventRepo        repo.EventRepository
 	contentReporter  *cacheContentReporter
@@ -2526,19 +2526,36 @@ func buildahIsolationArgs() []string {
 	}
 }
 
-// buildahEnv returns environment variables for buildah
-func (c *ImageClient) buildahEnv(runroot, tmpdir, storageConf string) []string {
-	env := append(os.Environ(),
-		"TMPDIR="+tmpdir,
-		"XDG_RUNTIME_DIR="+runroot,
-		"CONTAINERS_STORAGE_CONF="+storageConf,
+// buildahStore is the storage and scratch space of a build's buildah commands.
+type buildahStore struct {
+	graphroot, runroot, tmpdir, driver, conf string
+}
+
+// command returns a buildah sub command on the store. It runs in the network
+// of the build ctx belongs to, if it belongs to one.
+func (s *buildahStore) command(ctx context.Context, sub string, args []string, stdout, stderr io.Writer) *exec.Cmd {
+	argv := append([]string{"buildah", "--root", s.graphroot, "--runroot", s.runroot, "--storage-driver=" + s.driver, sub}, args...)
+	if network, ok := ctx.Value(buildNetworkKey{}).(buildNetwork); ok {
+		argv = append(network.enter(sub), argv...)
+	}
+	return newImageCommand(ctx, argv[0], argv[1:], s.env(), stdout, stderr)
+}
+
+// env is the worker's environment, with buildah pointed at the store.
+func (s *buildahStore) env() []string {
+	return append(os.Environ(),
+		"TMPDIR="+s.tmpdir,
+		"XDG_RUNTIME_DIR="+s.runroot,
+		"CONTAINERS_STORAGE_CONF="+s.conf,
 		"BUILDAH_LAYERS=true",
 		"BUILDAH_ISOLATION=oci",
 		"GOMAXPROCS=0",
-		"PIGZ=-p"+fmt.Sprintf("%d", runtime.NumCPU()),
+		fmt.Sprintf("PIGZ=-p%d", runtime.NumCPU()),
 	)
-	return env
 }
+
+// buildNetworkKey carries the network of the build a context belongs to.
+type buildNetworkKey struct{}
 
 // getBuildahAuthArgs returns buildah authentication arguments from user-provided credentials
 // Expects credentials in username:password format (either directly or in JSON)
@@ -2727,16 +2744,6 @@ func newImageCommand(ctx context.Context, command string, args []string, env []s
 	return cmd
 }
 
-// buildNetnsKey carries the network namespace of the build a context belongs to.
-type buildNetnsKey struct{}
-
-func newBuildahCommand(ctx context.Context, args []string, env []string, stdout, stderr io.Writer) *exec.Cmd {
-	if netnsPath, ok := ctx.Value(buildNetnsKey{}).(string); ok {
-		return newImageCommand(ctx, "nsenter", append([]string{"--net=" + netnsPath, "--", "buildah"}, args...), env, stdout, stderr)
-	}
-	return newImageCommand(ctx, "buildah", args, env, stdout, stderr)
-}
-
 func terminateImageProcessGroup(pid int) error {
 	pgid, err := syscall.Getpgid(pid)
 	if err != nil {
@@ -2866,13 +2873,13 @@ func (c *ImageClient) warmBaseImageLayersInBackground(ctx context.Context, reque
 
 func (c *ImageClient) BuildAndArchiveImage(ctx context.Context, outputLogger *slog.Logger, request *types.ContainerRequest) error {
 	startTime := time.Now()
-	if c.buildNetwork != nil {
-		netnsPath, release, err := c.buildNetwork()
+	if c.newBuildNetwork != nil {
+		network, release, err := c.newBuildNetwork()
 		if err != nil {
 			return err
 		}
 		defer release()
-		ctx = context.WithValue(ctx, buildNetnsKey{}, netnsPath)
+		ctx = context.WithValue(ctx, buildNetworkKey{}, network)
 	}
 
 	// Use /dev/shm (tmpfs/RAM) for buildah storage to eliminate disk I/O bottlenecks
@@ -2910,6 +2917,8 @@ func (c *ImageClient) BuildAndArchiveImage(ctx context.Context, outputLogger *sl
 			os.Remove(storageConf)
 		}
 	}()
+	store := &buildahStore{graphroot: graphroot, runroot: runroot, tmpdir: tmpdir, driver: storageDriver, conf: storageConf}
+
 	sourceImage := ""
 	if request.BuildOptions.SourceImage != nil {
 		sourceImage = *request.BuildOptions.SourceImage
@@ -2963,7 +2972,7 @@ func (c *ImageClient) BuildAndArchiveImage(ctx context.Context, outputLogger *sl
 			outputLogger.Info("Using cached base image layers\n")
 		} else {
 			// buildah pull the base image so bud doesn't attempt HTTPS
-			pullArgs := []string{"--root", graphroot, "--runroot", runroot, "--storage-driver=" + storageDriver, "pull"}
+			var pullArgs []string
 			if insecure {
 				pullArgs = append(pullArgs, "--tls-verify=false")
 			}
@@ -2974,13 +2983,7 @@ func (c *ImageClient) BuildAndArchiveImage(ctx context.Context, outputLogger *sl
 			}
 
 			pullArgs = append(pullArgs, "docker://"+sourceImage)
-			cmd := newBuildahCommand(
-				ctx,
-				pullArgs,
-				c.buildahEnv(runroot, tmpdir, storageConf),
-				&common.ExecWriter{Logger: outputLogger},
-				&common.ExecWriter{Logger: outputLogger},
-			)
+			cmd := store.command(ctx, "pull", pullArgs, &common.ExecWriter{Logger: outputLogger}, &common.ExecWriter{Logger: outputLogger})
 			if err := cmd.Run(); err != nil {
 				return err
 			}
@@ -3002,8 +3005,7 @@ func (c *ImageClient) BuildAndArchiveImage(ctx context.Context, outputLogger *sl
 	fmt.Fprint(f, dockerfile)
 	f.Close()
 
-	budArgs := []string{"--root", graphroot, "--runroot", runroot, "--storage-driver=" + storageDriver, "bud"}
-	budArgs = append(budArgs, buildahIsolationArgs()...)
+	budArgs := buildahIsolationArgs()
 	if insecure {
 		budArgs = append(budArgs, "--tls-verify=false")
 	}
@@ -3071,8 +3073,7 @@ func (c *ImageClient) BuildAndArchiveImage(ctx context.Context, outputLogger *sl
 				// same on both paths.
 				return c.buildLayeredImage(ctx, outputLogger, request, &layeredBuild{
 					c: c, ctx: ctx, out: outputLogger, request: request, plan: plan,
-					sourceImage: manifestRef, fromRef: plan.from,
-					graphroot: graphroot, runroot: runroot, tmpdir: tmpdir, storage: storageDriver, storageConf: storageConf,
+					sourceImage: manifestRef, fromRef: plan.from, store: store,
 					buildCtxPath: buildCtxPath, runVolumes: runVolumes, buildArgs: buildArgMap(request.BuildOptions.BuildSecrets),
 				})
 			}
@@ -3084,7 +3085,7 @@ func (c *ImageClient) BuildAndArchiveImage(ctx context.Context, outputLogger *sl
 		// Build w/ buildah
 		budArgs = append(budArgs, "-f", tempDockerFile, "-t", imageTag, buildCtxPath)
 		buildOutput := newActiveOutputWriter(outputLogger)
-		cmd := newBuildahCommand(ctx, budArgs, c.buildahEnv(runroot, tmpdir, storageConf), buildOutput, buildOutput)
+		cmd := store.command(ctx, "bud", budArgs, buildOutput, buildOutput)
 		buildStart := time.Now()
 		stopHeartbeat := startSilentOutputHeartbeat(ctx, outputLogger, buildStart, buildOutput, "Still building image...")
 		err = cmd.Run()
@@ -3094,32 +3095,20 @@ func (c *ImageClient) BuildAndArchiveImage(ctx context.Context, outputLogger *sl
 		}
 		outputLogger.Info(fmt.Sprintf("Image built in %.1fs\n", time.Since(buildStart).Seconds()))
 
-		return c.publishFromStorage(ctx, outputLogger, request, imageTag, &buildahStore{graphroot: graphroot, runroot: runroot, tmpdir: tmpdir, driver: storageDriver, conf: storageConf})
+		return c.publishFromStorage(ctx, outputLogger, request, imageTag, store)
 	}
 
 	// Clip v1: Build, push to OCI layout, then process locally
 	budArgs = append(budArgs, "-f", tempDockerFile, "-t", request.ImageId+":latest", buildCtxPath)
-	cmd := newBuildahCommand(
-		ctx,
-		budArgs,
-		c.buildahEnv(runroot, tmpdir, storageConf),
-		&common.ExecWriter{Logger: outputLogger},
-		&common.ExecWriter{Logger: outputLogger},
-	)
+	cmd := store.command(ctx, "bud", budArgs, &common.ExecWriter{Logger: outputLogger}, &common.ExecWriter{Logger: outputLogger})
 	err = cmd.Run()
 	if err != nil {
 		return err
 	}
 
 	// Push to local OCI layout (v1 clip path)
-	v1PushArgs := []string{"--root", graphroot, "--runroot", runroot, "--storage-driver=" + storageDriver, "push", request.ImageId + ":latest", "oci:" + ociPath + ":latest"}
-	cmd = newBuildahCommand(
-		ctx,
-		v1PushArgs,
-		c.buildahEnv(runroot, tmpdir, storageConf),
-		&common.ExecWriter{Logger: outputLogger},
-		&common.ExecWriter{Logger: outputLogger},
-	)
+	v1PushArgs := []string{request.ImageId + ":latest", "oci:" + ociPath + ":latest"}
+	cmd = store.command(ctx, "push", v1PushArgs, &common.ExecWriter{Logger: outputLogger}, &common.ExecWriter{Logger: outputLogger})
 	err = cmd.Run()
 	if err != nil {
 		return err
@@ -3425,15 +3414,6 @@ func downloadWorkspaceBuildContext(ctx context.Context, request *types.Container
 	return nil
 }
 
-// buildahStore locates a buildah storage root for follow-up commands.
-type buildahStore struct {
-	graphroot, runroot, tmpdir, driver, conf string
-}
-
-func (s *buildahStore) args(sub string) []string {
-	return []string{"--root", s.graphroot, "--runroot", s.runroot, "--storage-driver=" + s.driver, sub}
-}
-
 // publishFromStorage pushes the image tagged imageTag straight from buildah
 // storage to the build registry, indexes the pushed image and uploads the
 // index archive. Pushing from storage lets the registry transport reuse layer
@@ -3452,12 +3432,12 @@ func (c *ImageClient) publishFromStorage(ctx context.Context, outputLogger *slog
 	}
 
 	outputLogger.Info("Publishing image...\n")
-	pushArgs := append(store.args("push"),
+	pushArgs := []string{
 		"--compression-format", "gzip",
 		"--compression-level", "1",
 		"--retry", "5",
 		"--retry-delay", "1s",
-	)
+	}
 	if c.buildRegistryConfig().BuildRegistryInsecure {
 		pushArgs = append(pushArgs, "--tls-verify=false")
 	}
@@ -3469,7 +3449,7 @@ func (c *ImageClient) publishFromStorage(ctx context.Context, outputLogger *slog
 	pushStart := time.Now()
 	pushHeartbeat := newActiveOutputWriter(outputLogger)
 	stopHeartbeat := startSilentOutputHeartbeat(ctx, outputLogger, pushStart, pushHeartbeat, "Still publishing image...")
-	err := newBuildahCommand(ctx, pushArgs, c.buildahEnv(store.runroot, store.tmpdir, store.conf), &pushOutput, &pushOutput).Run()
+	err := store.command(ctx, "push", pushArgs, &pushOutput, &pushOutput).Run()
 	stopHeartbeat()
 	if err != nil {
 		return fmt.Errorf("failed to publish image: %w: %s", err, strings.TrimSpace(pushOutput.String()))

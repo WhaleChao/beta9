@@ -200,7 +200,7 @@ func TestLayeredBuildRunIsIsolatedFromWorker(t *testing.T) {
 	t.Setenv("BUILDAH_ISOLATION", "chroot")
 	b := &layeredBuild{
 		c: &ImageClient{}, ctx: context.Background(), out: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		container: "ctr", storage: "vfs",
+		container: "ctr", store: &buildahStore{driver: "vfs"},
 		declaredArgs: map[string]struct{}{"LD_PRELOAD": {}},
 		buildArgs:    map[string]string{"LD_PRELOAD": "/tenant.so"},
 	}

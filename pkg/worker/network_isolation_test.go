@@ -2,6 +2,8 @@ package worker
 
 import (
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -72,6 +74,39 @@ func TestIsolateContainersFollowsMovedEndpoints(t *testing.T) {
 	require.NoError(t, manager.isolateContainers())
 	require.Contains(t, manager.isolatedEndpoints, gateway)
 	require.Contains(t, manager.isolatedEndpoints, moved)
+}
+
+func TestBuildNetworkEnter(t *testing.T) {
+	nsenter := []string{"nsenter", "--net=/var/run/netns/build", "--"}
+	network := buildNetwork{netnsPath: "/var/run/netns/build"}
+	require.Equal(t, nsenter, network.enter("pull"), "the worker's resolv.conf works in the network")
+
+	network.resolvConf = workerResolvConfPath
+	withResolvConf := append(nsenter, "unshare", "--mount", "--propagation", "private", "--", "sh", "-c", bindResolvConf, workerResolvConfPath)
+	for _, sub := range []string{"pull", "from", "bud", "run", "add", "push"} {
+		require.Equal(t, withResolvConf, network.enter(sub), sub)
+	}
+	for _, sub := range []string{"mount", "umount"} {
+		require.Equal(t, nsenter, network.enter(sub), "the worker reads what %s mounts", sub)
+	}
+}
+
+func TestBuildResolvConf(t *testing.T) {
+	hostResolv := filepath.Join(t.TempDir(), "resolv.conf")
+	require.Equal(t, workerResolvConfPath, buildResolvConf(hostResolv), "no resolv.conf")
+
+	for _, tc := range []struct {
+		hostResolv string
+		want       string
+	}{
+		{"nameserver 127.0.0.53\noptions edns0 trust-ad\nsearch .\n", workerResolvConfPath},
+		{"nameserver ::1\n", workerResolvConfPath},
+		{"nameserver 10.43.0.10\n", ""},
+		{"nameserver 127.0.0.53\nnameserver 10.0.0.2\n", ""},
+	} {
+		require.NoError(t, os.WriteFile(hostResolv, []byte(tc.hostResolv), 0o644))
+		require.Equal(t, tc.want, buildResolvConf(hostResolv), tc.hostResolv)
+	}
 }
 
 func TestHostNetworks(t *testing.T) {

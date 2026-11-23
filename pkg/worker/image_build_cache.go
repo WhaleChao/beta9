@@ -191,15 +191,13 @@ func (c *ImageClient) trimBuildLayerCache(ctx context.Context, graphroot, driver
 	}
 	defer os.Remove(storageConf)
 	store := &buildahStore{graphroot: graphroot, runroot: runroot, tmpdir: tmpdir, driver: driver, conf: storageConf}
-	env := c.buildahEnv(runroot, tmpdir, storageConf)
 
 	// Leaked containers first: they hold unsized layers and pin images.
 	if stale, err := staleBuildahContainers(graphroot, driver, time.Now().Add(-buildLayerCacheStaleContainerAge), buildLayerCacheTrims.inFlightBuilds()); err != nil {
 		log.Warn().Err(err).Msg("build layer cache trim: cannot list working containers")
 	} else if len(stale) > 0 {
 		var out strings.Builder
-		args := append(store.args("rm"), stale...)
-		err := newBuildahCommand(ctx, args, env, &out, &out).Run()
+		err := store.command(ctx, "rm", stale, &out, &out).Run()
 		log.Info().Err(err).Int("containers", len(stale)).Str("output", strings.TrimSpace(out.String())).
 			Msg("removed stale build containers")
 	}
@@ -239,8 +237,7 @@ func (c *ImageClient) trimBuildLayerCache(ctx context.Context, graphroot, driver
 		}
 		attempted += len(batch)
 		var out strings.Builder
-		args := append(store.args("rmi"), batch...)
-		if err := newBuildahCommand(ctx, args, env, &out, &out).Run(); err != nil {
+		if err := store.command(ctx, "rmi", batch, &out, &out).Run(); err != nil {
 			// rmi keeps going past images it cannot remove and exits
 			// non-zero; the re-read below shows which ones went.
 			log.Debug().Err(err).Str("output", strings.TrimSpace(out.String())).Msg("build layer cache trim: some images not removed")

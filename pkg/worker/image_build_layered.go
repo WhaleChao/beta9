@@ -37,11 +37,7 @@ type layeredBuild struct {
 	plan         *dockerfilePlan
 	sourceImage  string // registry reference of FROM, used to fetch the manifest to append to
 	fromRef      string // what buildah from is given (may be a cached local layout)
-	graphroot    string
-	runroot      string
-	tmpdir       string
-	storage      string
-	storageConf  string
+	store        *buildahStore
 	buildCtxPath string
 	runVolumes   []string // --volume flags for RUN
 	buildArgs    map[string]string
@@ -62,18 +58,12 @@ type layeredBuild struct {
 	exposed    map[string]struct{}
 }
 
-func (b *layeredBuild) storageArgs(sub string) []string {
-	return []string{"--root", b.graphroot, "--runroot", b.runroot, "--storage-driver=" + b.storage, sub}
-}
-
 // quiet runs a buildah subcommand, returning the last line of its stdout (the
 // id or path buildah prints), or both streams folded into the error on
 // failure.
 func (b *layeredBuild) quiet(sub string, args ...string) (string, error) {
 	var stdout, stderr strings.Builder
-	env := b.c.buildahEnv(b.runroot, b.tmpdir, b.storageConf)
-	cmd := newBuildahCommand(b.ctx, append(b.storageArgs(sub), args...), env, &stdout, &stderr)
-	if err := cmd.Run(); err != nil {
+	if err := b.store.command(b.ctx, sub, args, &stdout, &stderr).Run(); err != nil {
 		return "", fmt.Errorf("buildah %s: %w: %s", sub, err, strings.TrimSpace(stderr.String()+"\n"+stdout.String()))
 	}
 	lines := strings.Fields(strings.TrimSpace(stdout.String()))
@@ -112,7 +102,7 @@ func (b *layeredBuild) execute() (upperDir string, err error) {
 	// land on the read-only mounts.
 	if b.c.config.ImageService.BuildApt != (types.BuildAptConfig{}) && !runStepsTouchAptConfig(b.plan.steps) {
 		if mountPoint, err := b.quiet("mount", b.container); err == nil {
-			b.runVolumes = append(b.runVolumes, aptBuildVolumes(b.c.config.ImageService.BuildApt, mountPoint, b.tmpdir)...)
+			b.runVolumes = append(b.runVolumes, aptBuildVolumes(b.c.config.ImageService.BuildApt, mountPoint, b.store.tmpdir)...)
 			if _, err := b.quiet("umount", b.container); err != nil {
 				log.Debug().Err(err).Msg("buildah umount after apt inspection")
 			}
@@ -168,8 +158,7 @@ func (b *layeredBuild) cleanup() {
 func (b *layeredBuild) step(step dockerfileStep) error {
 	switch step.kind {
 	case stepRun:
-		args := b.storageArgs("run")
-		args = append(args, buildahIsolationArgs()...)
+		args := buildahIsolationArgs()
 		for _, volume := range b.runVolumes {
 			args = append(args, "--volume", volume)
 		}
@@ -192,8 +181,7 @@ func (b *layeredBuild) step(step dockerfileStep) error {
 		}
 		output := newActiveOutputWriter(b.out)
 		stop := startSilentOutputHeartbeat(b.ctx, b.out, time.Now(), output, "Still running build step...")
-		env := b.c.buildahEnv(b.runroot, b.tmpdir, b.storageConf)
-		err := newBuildahCommand(b.ctx, args, env, output, output).Run()
+		err := b.store.command(b.ctx, "run", args, output, output).Run()
 		stop()
 		if err != nil {
 			return fmt.Errorf("build step failed: %s: %w", step.raw, err)
@@ -307,7 +295,7 @@ func (b *layeredBuild) mkdir(dir string) error {
 	if shellErr == nil {
 		return nil
 	}
-	empty := filepath.Join(b.tmpdir, "workdir-"+fmt.Sprintf("%d", b.stepsDone))
+	empty := filepath.Join(b.store.tmpdir, "workdir-"+fmt.Sprintf("%d", b.stepsDone))
 	if err := os.MkdirAll(empty, 0o755); err != nil {
 		return shellErr
 	}
@@ -453,7 +441,7 @@ func (c *ImageClient) buildLayeredImage(ctx context.Context, outputLogger *slog.
 			return err
 		}
 		outputLogger.Info(fmt.Sprintf("Image built in %.1fs\n", time.Since(started).Seconds()))
-		return c.publishFromStorage(ctx, outputLogger, request, imageTag, &buildahStore{graphroot: b.graphroot, runroot: b.runroot, tmpdir: b.tmpdir, driver: b.storage, conf: b.storageConf})
+		return c.publishFromStorage(ctx, outputLogger, request, imageTag, b.store)
 	}
 	outputLogger.Info(fmt.Sprintf("Image built in %.1fs\n", time.Since(started).Seconds()))
 

@@ -834,27 +834,26 @@ func TestDownloadedBuildContextIsPrivateToTheBuild(t *testing.T) {
 	require.Equal(t, "original", string(data), "a build must not change another build's context")
 }
 
-func TestNewBuildahCommandUsesCancelableProcessGroup(t *testing.T) {
-	cmd := newBuildahCommand(
-		context.Background(),
-		[]string{"--version"},
-		[]string{"TMPDIR=/tmp"},
-		io.Discard,
-		io.Discard,
-	)
+func TestBuildahCommandUsesCancelableProcessGroup(t *testing.T) {
+	store := &buildahStore{graphroot: "/graph", runroot: "/run", tmpdir: "/tmp", driver: "overlay", conf: "/run/storage.conf"}
+	cmd := store.command(context.Background(), "pull", []string{"docker://python:3.12"}, io.Discard, io.Discard)
 
-	require.Equal(t, []string{"buildah", "--version"}, cmd.Args)
-	require.Equal(t, []string{"TMPDIR=/tmp"}, cmd.Env)
+	require.Equal(t, []string{"buildah", "--root", "/graph", "--runroot", "/run", "--storage-driver=overlay", "pull", "docker://python:3.12"}, cmd.Args)
+	require.Subset(t, cmd.Env, []string{"TMPDIR=/tmp", "XDG_RUNTIME_DIR=/run", "CONTAINERS_STORAGE_CONF=/run/storage.conf", "BUILDAH_ISOLATION=oci"})
 	require.NotNil(t, cmd.Cancel)
 	require.NotNil(t, cmd.SysProcAttr)
 	require.True(t, cmd.SysProcAttr.Setpgid)
 	require.Equal(t, imageCommandCancelGracePeriod, cmd.WaitDelay)
 }
 
-func TestNewBuildahCommandRunsInBuildNetwork(t *testing.T) {
-	ctx := context.WithValue(context.Background(), buildNetnsKey{}, "/var/run/netns/build")
-	cmd := newBuildahCommand(ctx, []string{"--version"}, nil, io.Discard, io.Discard)
-	require.Equal(t, []string{"nsenter", "--net=/var/run/netns/build", "--", "buildah", "--version"}, cmd.Args)
+func TestBuildahCommandRunsInBuildNetwork(t *testing.T) {
+	store := &buildahStore{graphroot: "/graph", runroot: "/run", driver: "overlay"}
+	network := buildNetwork{netnsPath: "/var/run/netns/build", resolvConf: workerResolvConfPath}
+	ctx := context.WithValue(context.Background(), buildNetworkKey{}, network)
+	for _, sub := range []string{"pull", "mount"} {
+		cmd := store.command(ctx, sub, nil, io.Discard, io.Discard)
+		require.Equal(t, append(network.enter(sub), "buildah", "--root", "/graph", "--runroot", "/run", "--storage-driver=overlay", sub), cmd.Args)
+	}
 }
 
 func TestTerminateImageProcessGroupKillsDescendants(t *testing.T) {
