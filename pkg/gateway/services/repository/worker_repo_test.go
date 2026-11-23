@@ -98,6 +98,137 @@ func TestGetWorkerMeteringConfigRequiresAssignedManagedSlot(t *testing.T) {
 	require.False(t, response.Ok)
 }
 
+func TestGetWorkerMeteringConfigIncludesOriginAndOmitsVictoriaMetrics(t *testing.T) {
+	service := &WorkerRepositoryService{
+		workerRepo: &lifecycleWorkerRepo{worker: &types.Worker{
+			Id: "worker-1", WorkspaceId: "workspace-1", PoolName: "spot-h100-capacity", MachineId: "machine-1", ControlPlaneManaged: true,
+		}},
+		computeRepo: &lifecycleComputeRepo{slots: []*compute.AgentWorkerSlotState{{
+			WorkerID: "worker-1", WorkerTokenID: "token-1",
+		}}},
+		appConfig: types.AppConfig{Monitoring: types.MonitoringConfig{
+			MetricsCollector:        string(types.MetricsCollectorOpenMeter),
+			OpenMeter:               types.OpenMeterConfig{ServerUrl: "https://meter.example.com", ApiKey: "meter-key"},
+			ContainerCostHookConfig: types.ContainerCostHookConfig{Endpoint: "https://billing.example.com/quote", Token: "quote-key"},
+			VictoriaMetrics: types.VictoriaMetricsConfig{
+				PushURL:       "https://monitor.example.com/vmagent/api/v1/import/prometheus",
+				AuthToken:     "push-secret",
+				PushSecs:      10,
+				WriteURL:      "https://monitor.example.com/vmsingle/api/v1/write",
+				WriteUsername: "admin",
+				WritePassword: "do-not-vend-write-password",
+			},
+		}},
+	}
+	service.SetMachineOriginLookup(func(_ context.Context, machineID string) (*types.WorkerOrigin, error) {
+		require.Equal(t, "machine-1", machineID)
+		return &types.WorkerOrigin{
+			CapacitySource: "provisioned",
+			Provider:       "verda",
+			Cloud:          "verda",
+			Region:         "FIN-01",
+			Offer:          "1H100.80S",
+			Spot:           true,
+		}, nil
+	})
+	ctx := auth.ContextWithAuthInfo(context.Background(), &auth.AuthInfo{
+		Token:     &types.Token{ExternalId: "token-1", TokenType: types.TokenTypeWorker},
+		Workspace: &types.Workspace{ExternalId: "workspace-1"},
+	})
+
+	response, err := service.GetWorkerMeteringConfig(ctx, &pb.GetWorkerMeteringConfigRequest{WorkerId: "worker-1"})
+	require.NoError(t, err)
+	require.True(t, response.Ok)
+
+	var payload types.WorkerMeteringPayload
+	require.NoError(t, json.Unmarshal([]byte(response.MeteringJson), &payload))
+	require.Equal(t, types.VictoriaMetricsConfig{}, payload.VictoriaMetrics, "legacy VictoriaMetrics config is never vended to workers")
+	require.Equal(t, &types.WorkerOrigin{
+		CapacitySource: "provisioned",
+		Provider:       "verda",
+		Cloud:          "verda",
+		Region:         "FIN-01",
+		Offer:          "1H100.80S",
+		Spot:           true,
+	}, payload.Origin)
+
+	// A machine that was not bought for its pool has no provider on record.
+	service.SetMachineOriginLookup(func(context.Context, string) (*types.WorkerOrigin, error) { return nil, nil })
+	response, err = service.GetWorkerMeteringConfig(ctx, &pb.GetWorkerMeteringConfigRequest{WorkerId: "worker-1"})
+	require.NoError(t, err)
+	require.True(t, response.Ok)
+	payload = types.WorkerMeteringPayload{}
+	require.NoError(t, json.Unmarshal([]byte(response.MeteringJson), &payload))
+	require.Equal(t, &types.WorkerOrigin{CapacitySource: types.CapacitySourceExternal}, payload.Origin)
+
+	// A record that cannot be read is not a machine that was not bought: the
+	// worker is still metered, and is told nothing of where it came from
+	// rather than something that may be wrong.
+	service.SetMachineOriginLookup(func(context.Context, string) (*types.WorkerOrigin, error) {
+		return nil, errors.New("redis is down")
+	})
+	response, err = service.GetWorkerMeteringConfig(ctx, &pb.GetWorkerMeteringConfigRequest{WorkerId: "worker-1"})
+	require.NoError(t, err)
+	require.True(t, response.Ok)
+	payload = types.WorkerMeteringPayload{}
+	require.NoError(t, json.Unmarshal([]byte(response.MeteringJson), &payload))
+	require.Equal(t, &types.WorkerOrigin{}, payload.Origin)
+	require.Equal(t, "meter-key", payload.OpenMeter.ApiKey)
+}
+
+// Where a machine came from is told with the metering credentials, to the
+// workers that are told those and to no others. A worker on a machine the
+// platform does not control holds a private worker token: it is refused
+// before anything is looked up, as is a token that is not its worker's own.
+func TestGetWorkerMeteringConfigTellsNoOtherWorkerWhereAMachineCameFrom(t *testing.T) {
+	managed := func() *types.Worker {
+		return &types.Worker{Id: "worker-1", WorkspaceId: "workspace-1", PoolName: "spot-h100-capacity", MachineId: "machine-1", ControlPlaneManaged: true}
+	}
+	assigned := []*compute.AgentWorkerSlotState{{WorkerID: "worker-1", WorkerTokenID: "token-1"}}
+	caller := func(tokenType, workspace string) *auth.AuthInfo {
+		return &auth.AuthInfo{
+			Token:     &types.Token{ExternalId: "token-1", TokenType: tokenType, WorkerID: "worker-1"},
+			Workspace: &types.Workspace{ExternalId: workspace},
+		}
+	}
+	unmanaged := managed()
+	unmanaged.ControlPlaneManaged = false
+
+	for name, tc := range map[string]struct {
+		worker *types.Worker
+		slots  []*compute.AgentWorkerSlotState
+		caller *auth.AuthInfo
+	}{
+		"a private worker, on a machine that is not trusted": {managed(), assigned, caller(types.TokenTypeWorkerPrivate, "workspace-1")},
+		"a workspace token":                          {managed(), assigned, caller(types.TokenTypeWorkspace, "workspace-1")},
+		"a worker of another workspace":              {managed(), assigned, caller(types.TokenTypeWorker, "workspace-2")},
+		"a worker the control plane does not manage": {unmanaged, assigned, caller(types.TokenTypeWorker, "workspace-1")},
+		"a token that is not the worker's":           {managed(), []*compute.AgentWorkerSlotState{{WorkerID: "worker-1", WorkerTokenID: "token-2"}}, caller(types.TokenTypeWorker, "workspace-1")},
+		"a token of another worker's slot":           {managed(), []*compute.AgentWorkerSlotState{{WorkerID: "worker-2", WorkerTokenID: "token-1"}}, caller(types.TokenTypeWorker, "workspace-1")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			service := &WorkerRepositoryService{
+				workerRepo:  &lifecycleWorkerRepo{worker: tc.worker},
+				computeRepo: &lifecycleComputeRepo{slots: tc.slots},
+				appConfig: types.AppConfig{Monitoring: types.MonitoringConfig{
+					MetricsCollector:        string(types.MetricsCollectorOpenMeter),
+					OpenMeter:               types.OpenMeterConfig{ServerUrl: "https://meter.example.com", ApiKey: "meter-key"},
+					ContainerCostHookConfig: types.ContainerCostHookConfig{Endpoint: "https://billing.example.com/quote", Token: "quote-key"},
+				}},
+			}
+			service.SetMachineOriginLookup(func(context.Context, string) (*types.WorkerOrigin, error) {
+				t.Fatal("where the machine came from was looked up for a caller that is told nothing")
+				return nil, nil
+			})
+
+			response, err := service.GetWorkerMeteringConfig(auth.ContextWithAuthInfo(context.Background(), tc.caller), &pb.GetWorkerMeteringConfigRequest{WorkerId: "worker-1"})
+			require.NoError(t, err)
+			require.False(t, response.Ok)
+			require.Empty(t, response.MeteringJson)
+		})
+	}
+}
+
 func TestGetWorkerServiceProxyConfigNamesThePublicTCPListener(t *testing.T) {
 	request := &pb.GetWorkerServiceProxyConfigRequest{WorkerId: "worker-1"}
 	service := &WorkerRepositoryService{}

@@ -280,6 +280,7 @@ func (s *Service) createPlanReservations(ctx context.Context, workspaceID string
 			// provider that lists a price and not what it has.
 			bought, took := watch.OutcomeOf(purchase.Offer), time.Since(now)
 			bought.Source = watch.SourceReservation
+			bought.MachineID = machineID
 			s.outcomes.Record(bought.Bought(err, took))
 			if err == nil && instance.Status == providers.StatusActive {
 				// It is recorded as running, so the reconciler will not see
@@ -316,8 +317,10 @@ func (s *Service) createPlanReservations(ctx context.Context, workspaceID string
 // from the offer, its state from the instance, and the terms from the launch.
 func newReservation(pool model.Pool, machineID, name string, offer providers.Offer, instance providers.Instance, now time.Time) model.Reservation {
 	status := model.ReservationPending
+	var activatedAt time.Time
 	if instance.Status == providers.StatusActive {
 		status = model.ReservationActive
+		activatedAt = now
 	}
 	return model.Reservation{
 		ID:                instance.ID,
@@ -343,6 +346,7 @@ func newReservation(pool model.Pool, machineID, name string, offer providers.Off
 		Source:            model.SourceCLIReservation,
 		Status:            status,
 		CreatedAt:         now,
+		ActivatedAt:       activatedAt,
 		ExpiresAt:         now.Add(pool.TTL),
 		BillingRenewalAt:  now.Add(time.Hour),
 		LastStatusMessage: instance.StatusDetail,
@@ -466,7 +470,7 @@ func (s *Service) deleteLaunchedInstances(ctx context.Context, workspaceID, pool
 	for _, reservation := range reservations {
 		err := s.deleteInstance(ctx, &reservation, now)
 		if err == nil {
-			s.recordEnd(reservation, watch.ResultReleased, now)
+			s.recordEnd(reservation, reservationBooted(reservation, reservation.Status), watch.ResultReleased, now)
 			continue
 		}
 		if errors.Is(err, errNotListed) && !unanswered {

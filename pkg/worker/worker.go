@@ -569,7 +569,8 @@ func NewWorker() (_ *Worker, err error) {
 	if !poolFound {
 		return nil, errors.New("invalid worker pool name")
 	}
-	if err := hydrateManagedWorkerMetering(ctx, workerId, &config, poolConfig, workerRepoClient); err != nil {
+	hydratedOrigin, err := hydrateManagedWorkerMetering(ctx, workerId, &config, poolConfig, workerRepoClient)
+	if err != nil {
 		return nil, err
 	}
 	if err := hydrateAgentWorkerServiceProxy(ctx, workerId, &config, poolConfig, workerRepoClient); err != nil {
@@ -815,6 +816,7 @@ func NewWorker() (_ *Worker, err error) {
 		cancel()
 		return nil, err
 	}
+	workerMetrics.SetAttribution(workerPoolName, machineID, resolveWorkerOrigin(poolConfig.Mode, hydratedOrigin))
 
 	worker.workerUsageMetrics = workerMetrics
 	worker.containerServer = containerServer
@@ -823,25 +825,50 @@ func NewWorker() (_ *Worker, err error) {
 	return worker, nil
 }
 
+// resolveWorkerOrigin is where the worker's machine came from: what the
+// control plane said of it, or failing that what the pool's mode says. Only
+// the control plane knows the provider of a machine, so the rest is left
+// empty rather than guessed.
+//
+// A machine of an external pool was either bought for the pool or joined it,
+// and only the control plane knows which. A control plane from before it
+// said so leaves the worker with nothing to say.
+func resolveWorkerOrigin(mode types.PoolMode, hydrated *types.WorkerOrigin) types.WorkerOrigin {
+	if hydrated != nil {
+		return *hydrated
+	}
+	switch mode {
+	case types.PoolModeExternal:
+		return types.WorkerOrigin{}
+	case types.PoolModePrivate:
+		return types.WorkerOrigin{CapacitySource: types.CapacitySourcePrivate}
+	case types.PoolModeProvider:
+		return types.WorkerOrigin{CapacitySource: types.CapacitySourceProvider}
+	default:
+		return types.WorkerOrigin{CapacitySource: types.CapacitySourceCluster}
+	}
+}
+
 // hydrateManagedWorkerMetering fetches the control plane's metering config
-// for a control-plane managed agent worker, which boots without one; failing
-// here stops the worker rather than letting it run containers unmetered.
-func hydrateManagedWorkerMetering(ctx context.Context, workerID string, config *types.AppConfig, pool types.WorkerPoolConfig, client pb.WorkerRepositoryServiceClient) error {
+// (and provider origin, when provisioned) for a control-plane managed agent
+// worker, which boots without one; failing here stops the worker rather than
+// letting it run containers unmetered.
+func hydrateManagedWorkerMetering(ctx context.Context, workerID string, config *types.AppConfig, pool types.WorkerPoolConfig, client pb.WorkerRepositoryServiceClient) (*types.WorkerOrigin, error) {
 	if pool.Mode != types.PoolModeExternal || !pool.AgentHosted() || config.Monitoring.Metered() {
-		return nil
+		return nil, nil
 	}
 	requestCtx, cancel := context.WithTimeout(ctx, containerRequestAckTimeout)
 	defer cancel()
 	resp, err := handleGRPCResponse(client.GetWorkerMeteringConfig(requestCtx, &pb.GetWorkerMeteringConfigRequest{WorkerId: workerID}))
 	if err != nil {
-		return fmt.Errorf("load managed worker metering config: %w", err)
+		return nil, fmt.Errorf("load managed worker metering config: %w", err)
 	}
-	var metering types.MonitoringConfig
-	if err := json.Unmarshal([]byte(resp.MeteringJson), &metering); err != nil {
-		return fmt.Errorf("load managed worker metering config: %w", err)
+	var payload types.WorkerMeteringPayload
+	if err := json.Unmarshal([]byte(resp.MeteringJson), &payload); err != nil {
+		return nil, fmt.Errorf("load managed worker metering config: %w", err)
 	}
-	config.Monitoring.SetMetering(metering)
-	return nil
+	config.Monitoring.SetMetering(payload.MonitoringConfig)
+	return payload.Origin, nil
 }
 
 // hydrateAgentWorkerServiceProxy points an agent-hosted worker's service proxy

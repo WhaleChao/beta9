@@ -103,3 +103,76 @@ func TestOutcomesAreLeftOutAndGroupedAsPricesAre(t *testing.T) {
 	_, err := market.reader().Outcomes(context.Background(), SeriesRequest{Range: "24h", Group: []string{ByProvider}})
 	assert.ErrorIs(t, err, ErrAdminOnly)
 }
+
+func TestPreBootInterruptionsDoNotSkewPreemptedShareOrTimeAfterSpinup(t *testing.T) {
+	market := newTestMarket(t, providers.NewFake("nebius", "test"))
+	recorder := NewRecorder(market.log, StreamsOf(market.config), market.clock)
+	base := OutcomeOf(h100("1gpu-h100", "eu-north1", 1, 1_000_000, spot))
+	base.Provider = "nebius"
+	base.Source = SourcePool
+	base.Pool = "spot-h100-capacity"
+
+	record := func(at time.Duration, o Outcome) {
+		o.At = noon.Add(at)
+		recorder.Record(o)
+	}
+
+	// Ten machines taken back 15s into boot before ever becoming active.
+	for i := range 10 {
+		o := base
+		o.MachineID = "preboot-" + string(rune('a'+i))
+		record(time.Duration(i)*time.Second, o.Bought(nil, time.Second))
+		record(time.Duration(i)*time.Second+15*time.Second, o.EndedAfter(ResultInterrupted, 15*time.Second, 0, 0, false))
+	}
+
+	// Four machines that booted in 3m: three preempted after 20m, 40m, 60m of
+	// running (total life 23m, 43m, 63m), and one released cleanly after 2h.
+	for i, ran := range []time.Duration{20 * time.Minute, 40 * time.Minute, 60 * time.Minute} {
+		o := base
+		o.MachineID = "ran-preempt-" + string(rune('a'+i))
+		record(time.Minute, o.CameUp(3*time.Minute))
+		record(3*time.Minute+ran, o.EndedAfter(ResultInterrupted, 3*time.Minute+ran, 3*time.Minute, ran, true))
+	}
+	released := base
+	released.MachineID = "ran-released"
+	record(time.Minute, released.CameUp(3*time.Minute))
+	record(2*time.Hour+3*time.Minute, released.EndedAfter(ResultReleased, 2*time.Hour+3*time.Minute, 3*time.Minute, 2*time.Hour, true))
+
+	recorder.Flush(context.Background())
+	market.clock.Advance(4 * time.Hour)
+
+	answer, err := market.reader().Outcomes(context.Background(), SeriesRequest{Range: "24h", Admin: true, Group: []string{ByProvider}})
+	require.NoError(t, err)
+	require.Len(t, answer.Series, 1)
+	assert.Equal(t, OutcomeSummary{
+		BootP50:           seconds(180),
+		BootP90:           seconds(180),
+		PreemptedShare:    seconds(0.75), // 3 of 4 booted machines, not 13 of 14
+		PreemptedAfterP50: seconds(2400), // 40m running after spin-up, not 15s and not 43m
+	}, answer.Series[0].Summary)
+
+	// Verify new wire fields round-trip cleanly through S2 storage.
+	readBack, err := recorder.Read(context.Background(), noon.Add(-time.Minute), noon.Add(4*time.Hour))
+	require.NoError(t, err)
+	var sawPreBoot, sawBooted bool
+	for _, o := range readBack {
+		if o.MachineID == "preboot-a" && o.Event == OutcomeEnd {
+			sawPreBoot = true
+			require.Equal(t, "spot-h100-capacity", o.Pool)
+			require.NotNil(t, o.Booted)
+			require.False(t, *o.Booted)
+			require.Zero(t, o.Boot)
+			require.Zero(t, o.Ran)
+		}
+		if o.MachineID == "ran-preempt-b" && o.Event == OutcomeEnd {
+			sawBooted = true
+			require.NotNil(t, o.Booted)
+			require.True(t, *o.Booted)
+			require.Equal(t, 3*time.Minute, o.Boot)
+			require.Equal(t, 40*time.Minute, o.Ran)
+			require.Equal(t, 43*time.Minute, o.Took)
+		}
+	}
+	require.True(t, sawPreBoot)
+	require.True(t, sawBooted)
+}

@@ -75,7 +75,9 @@ func (f OfferFilter) Matches(offer Offer) bool {
 	if len(f.GPUs) > 0 && !slices.Contains(f.GPUs, offer.GPU) {
 		return false
 	}
-	return len(f.Regions) == 0 || slices.Contains(f.Regions, offer.Region)
+	return len(f.Regions) == 0 || slices.ContainsFunc(f.Regions, func(region string) bool {
+		return strings.EqualFold(strings.TrimSpace(region), offer.Region)
+	})
 }
 
 // matching returns the offers the filter lets through, in the order they

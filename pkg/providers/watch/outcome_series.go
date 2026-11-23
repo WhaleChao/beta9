@@ -164,10 +164,19 @@ func (t *outcomeTally) add(outcome Outcome) {
 	case outcome.Event == OutcomeActive:
 		t.boots = append(t.boots, outcome.Took)
 	case outcome.Event == OutcomeEnd && outcome.Result != ResultNeverUp:
+		// Preempted share and time-to-preemption are defined for machines
+		// that came up; exclude machines lost before reaching active.
+		if outcome.Booted != nil && !*outcome.Booted {
+			return
+		}
 		t.ended++
 		if outcome.Result == ResultInterrupted {
 			t.preempted++
-			t.preemptedAfter = append(t.preemptedAfter, outcome.Took)
+			after := outcome.Took
+			if outcome.Ran > 0 {
+				after = outcome.Ran
+			}
+			t.preemptedAfter = append(t.preemptedAfter, after)
 		}
 	}
 }

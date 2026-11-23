@@ -37,6 +37,8 @@ type WorkerRepositoryService struct {
 	// holdsPoolHeadroom reports whether an idle worker keeps its pool at its
 	// floor (scheduler.WorkerHoldsPoolHeadroom). Nil: no worker does.
 	holdsPoolHeadroom func(worker *types.Worker) bool
+	// machineOrigin returns provider provenance for a provisioned machine.
+	machineOrigin func(ctx context.Context, machineID string) (*types.WorkerOrigin, error)
 	pb.UnimplementedWorkerRepositoryServiceServer
 }
 
@@ -71,6 +73,12 @@ func NewWorkerRepositoryService(ctx context.Context, workerRepo repository.Worke
 		service.workerEvents = newWorkerEventBroker(ctx, rdb)
 	}
 	return service
+}
+
+// SetMachineOriginLookup attaches the lookup used by GetWorkerMeteringConfig to
+// tell control-plane managed workers which provider and region supplied them.
+func (s *WorkerRepositoryService) SetMachineOriginLookup(lookup func(ctx context.Context, machineID string) (*types.WorkerOrigin, error)) {
+	s.machineOrigin = lookup
 }
 
 // AuthorizeRequest limits a worker token to the worker it was issued for and
@@ -348,11 +356,35 @@ func (s *WorkerRepositoryService) GetWorkerMeteringConfig(ctx context.Context, r
 	if !metering.Metered() || metering.ContainerCostHookConfig.Endpoint == "" || metering.ContainerCostHookConfig.Token == "" {
 		return fail("managed worker metering is not configured")
 	}
-	data, err := json.Marshal(metering)
+	data, err := json.Marshal(types.WorkerMeteringPayload{MonitoringConfig: metering, Origin: s.workerOrigin(ctx, worker)})
 	if err != nil {
 		return fail(err.Error())
 	}
 	return &pb.GetWorkerMeteringConfigResponse{Ok: true, MeteringJson: string(data)}, nil
+}
+
+// workerOrigin is what the control plane has on record of where a managed
+// worker's machine came from. It is looked up by the machine the control
+// plane gave the worker, never by anything the worker says, and it is told
+// only to a worker GetWorkerMeteringConfig has let through.
+//
+// Where the record cannot be read, the origin says nothing rather than
+// something that may be wrong: the worker reports it as it is, and its usage
+// still names its machine.
+func (s *WorkerRepositoryService) workerOrigin(ctx context.Context, worker *types.Worker) *types.WorkerOrigin {
+	if s.machineOrigin == nil || worker.MachineId == "" {
+		return &types.WorkerOrigin{}
+	}
+	origin, err := s.machineOrigin(ctx, worker.MachineId)
+	if err != nil {
+		log.Warn().Err(err).Str("worker_id", worker.Id).Str("machine_id", worker.MachineId).Msg("could not read where a worker's machine came from; its usage will not say")
+		return &types.WorkerOrigin{}
+	}
+	if origin == nil {
+		// The machine joined its pool, and was not bought for it.
+		return &types.WorkerOrigin{CapacitySource: types.CapacitySourceExternal}
+	}
+	return origin
 }
 
 // GetWorkerServiceProxyConfig tells an agent-hosted worker where the TCP

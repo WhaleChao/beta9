@@ -34,6 +34,16 @@ const (
 	instanceFailedMessage = "the provider failed to start this machine"
 
 	instanceInterruptedMessage = "the provider took this machine back"
+
+	// bootTimedOutMessage starts what a reservation says of a machine that
+	// did not come up in the time it was given. Such a reservation ends for
+	// the reason a machine does that is given back because the rest of its
+	// launch failed, and the message is all the record keeps while a delete
+	// is tried again, so it is what tells the two apart.
+	bootTimedOutMessage = "the provider did not start this machine within"
+
+	// microsPerCent is how many millionths of a dollar a cent is.
+	microsPerCent = 10_000
 )
 
 func (s *Service) runReconciler(ctx context.Context) {
@@ -406,28 +416,33 @@ func (s *Service) recordManagedUsage(ctx context.Context, workspaceID string, st
 		duration := end.Sub(start)
 		hourlyCostMicros := s.billableMicros(reservation.HourlyCostMicros)
 		costCents := managedCostCents(hourlyCostMicros, duration)
+		providerCostCents := managedCostCents(reservation.HourlyCostMicros, duration)
 		if !force && !managedUsageRecordable(reservation, now, end, costCents) {
 			continue
 		}
 		usage := managedUsage{
-			WorkspaceID:        workspaceID,
-			PoolName:           state.Name,
-			ReservationID:      reservation.ID,
-			Provider:           reservation.Provider,
-			Cloud:              reservation.Cloud,
-			ProviderInstanceID: computeReservationInstanceID(*reservation),
-			MachineID:          reservation.MachineID,
-			GPU:                reservation.GPU,
-			GPUCount:           reservation.GPUCount,
-			NodeCount:          reservation.NodeCount,
-			CPUMillicores:      reservation.CPUMillicores,
-			MemoryMB:           reservation.MemoryMB,
-			StorageMB:          reservation.StorageMB,
-			HourlyCostMicros:   hourlyCostMicros,
-			DurationSeconds:    duration.Seconds(),
-			CostCents:          costCents,
-			StartAt:            start,
-			EndAt:              end,
+			WorkspaceID:          workspaceID,
+			PoolName:             state.Name,
+			ReservationID:        reservation.ID,
+			Provider:             reservation.Provider,
+			Cloud:                reservation.Cloud,
+			ProviderInstanceID:   computeReservationInstanceID(*reservation),
+			MachineID:            reservation.MachineID,
+			GPU:                  reservation.GPU,
+			GPUCount:             reservation.GPUCount,
+			NodeCount:            reservation.NodeCount,
+			CPUMillicores:        reservation.CPUMillicores,
+			MemoryMB:             reservation.MemoryMB,
+			StorageMB:            reservation.StorageMB,
+			HourlyCostMicros:     hourlyCostMicros,
+			DurationSeconds:      duration.Seconds(),
+			CostCents:            costCents,
+			StartAt:              start,
+			EndAt:                end,
+			Region:               reservation.Region,
+			Spot:                 reservation.Spot,
+			ProviderHourlyMicros: reservation.HourlyCostMicros,
+			ProviderCostCents:    providerCostCents,
 		}
 		if err := s.billing.RecordManagedUsage(ctx, usage); err != nil {
 			reservationFailed(workspaceID, state.Name, reservation, "record usage", err)
@@ -436,6 +451,7 @@ func (s *Service) recordManagedUsage(ctx context.Context, workspaceID string, st
 		}
 		reservation.BillingCursorAt = end
 		reservation.LastError = ""
+		s.recordReservationSpend(*reservation, reservationBooted(*reservation, reservation.Status), start, end, providerCostCents, costCents)
 		s.emitComputeEvent(types.EventComputePool, managedUsageRecordedEvent(workspaceID, state, *reservation, usage))
 		if err := s.recordManagedUsageMetrics(usage); err != nil {
 			reservationFailed(workspaceID, state.Name, reservation, "record usage metrics", err)
@@ -649,7 +665,7 @@ func managedCostCents(hourlyMicros int64, duration time.Duration) float64 {
 	if hourlyMicros <= 0 || duration <= 0 {
 		return 0
 	}
-	return float64(hourlyMicros) * duration.Hours() / 10000
+	return float64(hourlyMicros) * duration.Hours() / microsPerCent
 }
 
 func (s *Service) recordManagedUsageMetrics(usage managedUsage) error {
@@ -657,22 +673,26 @@ func (s *Service) recordManagedUsageMetrics(usage managedUsage) error {
 		return nil
 	}
 	metadata := map[string]interface{}{
-		"workspace_id":         usage.WorkspaceID,
-		"pool_name":            usage.PoolName,
-		"reservation_id":       usage.ReservationID,
-		"provider":             usage.Provider,
-		"cloud":                usage.Cloud,
-		"provider_instance_id": usage.ProviderInstanceID,
-		"machine_id":           usage.MachineID,
-		"gpu":                  usage.GPU,
-		"gpu_count":            usage.GPUCount,
-		"node_count":           usage.NodeCount,
-		"cpu_millicores":       usage.CPUMillicores,
-		"memory_mb":            usage.MemoryMB,
-		"storage_mb":           usage.StorageMB,
-		"hourly_cost_micros":   usage.HourlyCostMicros,
-		"duration_seconds":     usage.DurationSeconds,
-		"cost_cents":           usage.CostCents,
+		"workspace_id":                usage.WorkspaceID,
+		"pool_name":                   usage.PoolName,
+		"reservation_id":              usage.ReservationID,
+		"provider":                    usage.Provider,
+		"cloud":                       usage.Cloud,
+		"region":                      usage.Region,
+		"spot":                        usage.Spot,
+		"provider_instance_id":        usage.ProviderInstanceID,
+		"machine_id":                  usage.MachineID,
+		"gpu":                         usage.GPU,
+		"gpu_count":                   usage.GPUCount,
+		"node_count":                  usage.NodeCount,
+		"cpu_millicores":              usage.CPUMillicores,
+		"memory_mb":                   usage.MemoryMB,
+		"storage_mb":                  usage.StorageMB,
+		"hourly_cost_micros":          usage.HourlyCostMicros,
+		"provider_hourly_cost_micros": usage.ProviderHourlyMicros,
+		"duration_seconds":            usage.DurationSeconds,
+		"cost_cents":                  usage.CostCents,
+		"provider_cost_cents":         usage.ProviderCostCents,
 	}
 	if err := s.usageMetricsRepo.IncrementCounter(types.UsageMetricsManagedComputeReservationSeconds, metadata, usage.DurationSeconds); err != nil {
 		return fmt.Errorf("record managed compute reservation seconds: %w", err)
@@ -712,12 +732,13 @@ func (s *Service) reconcileReservationStatus(ctx context.Context, workspaceID st
 		bootTimeout := s.appConfig.ManagedCompute.Reservations.BootTimeoutOrDefault()
 		if !reservation.CreatedAt.IsZero() && !now.Before(reservation.CreatedAt.Add(bootTimeout)) {
 			s.terminateReservation(ctx, workspaceID, state, reservation, reconcileReasonLaunchFailed,
-				fmt.Sprintf("the provider did not start this machine within %s", bootTimeout), now)
+				fmt.Sprintf("%s %s", bootTimedOutMessage, bootTimeout), now)
 			return true
 		}
 		reservation.Status = model.ReservationPending
 	case providers.StatusActive:
 		if reservation.Status == model.ReservationPending {
+			reservation.ActivatedAt = now
 			s.outcomes.Record(reservationOutcome(*reservation).CameUp(now.Sub(reservation.CreatedAt)))
 		}
 		reservation.Status = model.ReservationActive
@@ -742,7 +763,7 @@ func (s *Service) reconcileReservationStatus(ctx context.Context, workspaceID st
 		// The machine went without Beam deleting it: the provider took it
 		// back, its own deletion timer fired, or someone removed it.
 		s.revokeReservationJoinToken(ctx, reservation)
-		s.outcomes.Record(reservationOutcome(*reservation).Ended(watch.ResultGone, now.Sub(reservation.CreatedAt)))
+		s.recordEnd(*reservation, reservationBooted(*reservation, before.Status), watch.ResultGone, now)
 		reservation.Status = model.ReservationDeleted
 		reservation.LastStatusMessage = firstNonEmpty(instance.StatusDetail, instanceGoneMessage)
 		reservation.LastError = ""
@@ -856,6 +877,7 @@ func (s *Service) terminateManagedReservations(ctx context.Context, workspaceID 
 // terminating, and the reconciler tries again. Callers pass a reservation
 // that is not closed already.
 func (s *Service) terminateReservation(ctx context.Context, workspaceID string, state *model.PoolState, reservation *model.Reservation, reason, message string, now time.Time) {
+	booted := reservationBooted(*reservation, reservation.Status)
 	// Registration tokens are persistent; kill them whenever a reservation closes.
 	s.revokeReservationJoinToken(ctx, reservation)
 	reservation.TerminatingReason = reason
@@ -886,8 +908,39 @@ func (s *Service) terminateReservation(ctx context.Context, workspaceID string, 
 		}
 	}
 	syncReservedNodes(state, now)
-	s.recordEnd(*reservation, reservationEnd(reason), now)
+	result := reservationEnd(reason)
+	if !booted && bootTimedOut(reason, message) {
+		result = watch.ResultNeverUp
+	}
+	s.recordEnd(*reservation, booted, result, now)
 	s.emitComputeEvent(types.EventComputePool, computeReservationEvent(workspaceID, state, *reservation, action, reason))
+}
+
+// reservationBooted reports whether a reservation's machine ever came up. A
+// reservation made before ActivatedAt was kept says so only by the status it
+// had before it ended.
+func reservationBooted(reservation model.Reservation, statusBefore model.ReservationStatus) bool {
+	return !reservation.ActivatedAt.IsZero() || statusBefore == model.ReservationActive
+}
+
+// bootTimedOut reports whether a reservation ends because its machine did
+// not come up in the time it was given.
+func bootTimedOut(reason, message string) bool {
+	return reason == reconcileReasonLaunchFailed && strings.HasPrefix(message, bootTimedOutMessage)
+}
+
+// recordReservationSpend writes to the market's history what a reservation's
+// machine cost at its provider from start to end, and what its tenant was
+// billed for that time.
+func (s *Service) recordReservationSpend(reservation model.Reservation, booted bool, start, end time.Time, providerCostCents, revenueCents float64) {
+	if computeReservationInstanceID(reservation) == "" || !end.After(start) {
+		return
+	}
+	s.outcomes.RecordSpend(watch.SpendOf(reservationOutcome(reservation), start, end, centsToMicros(providerCostCents), centsToMicros(revenueCents), booted))
+}
+
+func centsToMicros(cents float64) int64 {
+	return int64(math.Round(cents * microsPerCent))
 }
 
 // syncReservedNodes counts the nodes of a pool's open reservations again,
@@ -903,13 +956,30 @@ func syncReservedNodes(state *model.PoolState, now time.Time) bool {
 }
 
 // recordEnd writes to the market's history that a reservation's machine is
-// gone at its provider, and how it ended. A reservation whose provider
-// never made a machine has none that ended.
-func (s *Service) recordEnd(reservation model.Reservation, result string, now time.Time) {
+// gone at its provider: how it ended, and what it cost there since its
+// tenant was last billed for it, which nobody is billed for. A reservation
+// whose provider never made a machine has none that ended.
+//
+// Usage is recorded before a machine is given back, and moves the billing
+// cursor, so what is left here was not written as spend already.
+func (s *Service) recordEnd(reservation model.Reservation, booted bool, result string, now time.Time) {
 	if computeReservationInstanceID(reservation) == "" {
 		return
 	}
-	s.outcomes.Record(reservationOutcome(reservation).Ended(result, now.Sub(reservation.CreatedAt)))
+	unbilledFrom := reservation.BillingCursorAt
+	if unbilledFrom.Before(reservation.CreatedAt) {
+		unbilledFrom = reservation.CreatedAt
+	}
+	if reservation.Managed() && !unbilledFrom.IsZero() {
+		s.recordReservationSpend(reservation, booted, unbilledFrom, now, managedCostCents(reservation.HourlyCostMicros, now.Sub(unbilledFrom)), 0)
+	}
+	var boot, ran time.Duration
+	if booted && !reservation.ActivatedAt.IsZero() {
+		boot = reservation.ActivatedAt.Sub(reservation.CreatedAt)
+		ran = now.Sub(reservation.ActivatedAt)
+	}
+	ended := reservationOutcome(reservation).EndedAfter(result, now.Sub(reservation.CreatedAt), boot, ran, booted)
+	s.outcomes.Record(ended)
 }
 
 // reservationOutcome is what the market's history is told of a reserved
@@ -927,6 +997,7 @@ func reservationOutcome(reservation model.Reservation) watch.Outcome {
 		Spot:             reservation.Spot,
 	})
 	outcome.Source = watch.SourceReservation
+	outcome.MachineID = reservation.MachineID
 	return outcome
 }
 

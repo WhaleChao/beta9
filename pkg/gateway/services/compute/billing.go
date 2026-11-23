@@ -131,6 +131,13 @@ type managedUsage struct {
 	CostCents          float64   `json:"cost_cents"`
 	StartAt            time.Time `json:"start_at"`
 	EndAt              time.Time `json:"end_at"`
+
+	// Provider-side metadata for OpenMeter and S2 spend economics; omitted from
+	// the external billing HTTP payload.
+	Region               string  `json:"-"`
+	Spot                 bool    `json:"-"`
+	ProviderHourlyMicros int64   `json:"-"`
+	ProviderCostCents    float64 `json:"-"`
 }
 
 func newManagedComputeBillingClient(config types.ManagedComputeBillingConfig) managedComputeBillingClient {

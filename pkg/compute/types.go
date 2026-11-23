@@ -194,10 +194,13 @@ type Reservation struct {
 	HourlyCostMicros int64
 	CommittedMicros  int64
 	// Spot marks a machine its provider may take back at any time.
-	Spot                  bool
-	Source                CapacitySource
-	Status                ReservationStatus
-	CreatedAt             time.Time
+	Spot      bool
+	Source    CapacitySource
+	Status    ReservationStatus
+	CreatedAt time.Time
+	// ActivatedAt is when the provider first reported the machine active. Zero
+	// while pending or on reservations created before this field existed.
+	ActivatedAt           time.Time
 	ExpiresAt             time.Time
 	BillingRenewalAt      time.Time
 	BillingCursorAt       time.Time

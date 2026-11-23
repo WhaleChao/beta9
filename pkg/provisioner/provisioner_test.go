@@ -3671,6 +3671,18 @@ func (r *recorded) outcomes(t *testing.T) []watch.Outcome {
 	return outcomes
 }
 
+func (r *recorded) spends(t *testing.T) []watch.Spend {
+	t.Helper()
+	r.recorder.FlushSpend(context.Background())
+	var spends []watch.Spend
+	for _, record := range r.log.All("spend") {
+		var spend watch.Spend
+		require.NoError(t, json.Unmarshal(record.Body, &spend))
+		spends = append(spends, spend)
+	}
+	return spends
+}
+
 // A provider that names a price and not its stock is known to have had a
 // machine only from being asked for one. Every machine a pool buys is
 // written to the market's history: how the purchase went, how long the
@@ -3701,6 +3713,7 @@ func TestWhatBecomesOfAMachineAPoolBuysIsWrittenToTheMarketsHistory(t *testing.T
 		At: bought, Event: watch.OutcomeCreate, Result: watch.ResultOK, Source: watch.SourcePool,
 		Provider: "verda", Cloud: "verda", Region: "FIN-01", Geo: "eu-north", Offer: "1L40S.20V", Spot: true,
 		GPU: "L40S", GPUs: 1, HourlyMicros: 100 * microsPerCent,
+		MachineID: machine.ID, Pool: "spot-l40s",
 	}, create)
 
 	require.Equal(t, watch.OutcomeActive, active.Event)
@@ -3711,8 +3724,13 @@ func TestWhatBecomesOfAMachineAPoolBuysIsWrittenToTheMarketsHistory(t *testing.T
 	require.Equal(t, watch.ResultInterrupted, end.Result)
 	require.Equal(t, ended, end.At)
 	require.Equal(t, ended.Sub(bought), end.Took, "how long the machine was had")
+	require.NotNil(t, end.Booted)
+	require.True(t, *end.Booted, "it joined before it was preempted")
+	require.Equal(t, up.Sub(bought), end.Boot, "spin-up duration carried on end")
+	require.Equal(t, ended.Sub(up), end.Ran, "time running after spin-up")
 	for _, later := range []watch.Outcome{active, end} {
-		later.At, later.Event, later.Result, later.Took = create.At, create.Event, create.Result, create.Took
+		later.At, later.Event, later.Result, later.Took, later.Booted, later.Boot, later.Ran =
+			create.At, create.Event, create.Result, create.Took, nil, 0, 0
 		require.Equal(t, create, later, "every outcome of a machine says the same of what it was bought as")
 	}
 }
@@ -4138,4 +4156,155 @@ func TestAPoolThatIsBuyingItsLastMachineIsStillWaitedFor(t *testing.T) {
 	w.buy("spot-l40s")
 	w.clock.Advance(recordsMaxAge)
 	require.False(t, w.CanProvision(w.ctx, "spot-l40s", anyMachine))
+}
+
+func TestPreBootInterruptionMarksBootedFalseAndStoreOriginReturnsProvenance(t *testing.T) {
+	w, told := recordingOutcomes(t)
+	w.Tick(w.ctx)
+
+	machine := w.buy("spot-l40s")
+	origin, err := w.store.Origin(w.ctx, machine.ID)
+	require.NoError(t, err)
+	require.Equal(t, &types.WorkerOrigin{
+		CapacitySource: "provisioned",
+		Provider:       "verda",
+		Cloud:          "verda",
+		Region:         "FIN-01",
+		Offer:          "1L40S.20V",
+		Spot:           true,
+	}, origin)
+
+	missing, err := w.store.Origin(w.ctx, "no-such-machine")
+	require.NoError(t, err)
+	require.Nil(t, missing)
+
+	// Interrupt before the worker ever joins.
+	w.after(tickInterval)
+	w.verda.SetStatus(machine.InstanceID, providers.StatusInterrupted, "preempted")
+	w.after(tickInterval)
+
+	outcomes := told.outcomes(t)
+	require.Len(t, outcomes, 2, "create and end only; never active")
+	end := outcomes[1]
+	require.Equal(t, watch.OutcomeEnd, end.Event)
+	require.Equal(t, watch.ResultInterrupted, end.Result)
+	require.Equal(t, machine.ID, end.MachineID)
+	require.Equal(t, "spot-l40s", end.Pool)
+	require.NotNil(t, end.Booted)
+	require.False(t, *end.Booted)
+	require.Zero(t, end.Boot)
+	require.Zero(t, end.Ran)
+}
+
+func TestPoolRegionMatchingIsCaseInsensitiveAndFallsBackToVerda(t *testing.T) {
+	w := newWorld(t)
+	nebius := providers.NewFake("nebius", testOwner)
+	nebiusOffer := providers.Offer{
+		ID: "1gpu-h100", Provider: "nebius", Cloud: "nebius", Region: "eu-north1",
+		GPU: "H100", GPUCount: 1, CPUMillicores: 16_000, MemoryMB: 128_000,
+		HourlyCostMicros: 100 * microsPerCent, Spot: true,
+	}
+	verdaOffer := providers.Offer{
+		ID: "1H100.80S", Provider: "verda", Cloud: "verda", Region: "FIN-01",
+		GPU: "H100", GPUCount: 1, CPUMillicores: 20_000, MemoryMB: 128_000,
+		HourlyCostMicros: 268 * microsPerCent, Spot: true,
+	}
+	nebius.SetOffers(nebiusOffer)
+	w.verda.SetOffers(verdaOffer)
+	w.Provisioner = w.replica(func(opts *Options) { opts.Providers = providers.RegistryOf(w.verda, nebius) })
+	w.control.pools["spot-h100"] = types.WorkerPoolConfig{
+		GPUType: "H100",
+		Provisioning: types.WorkerPoolProvisioningConfig{
+			Providers: []string{"nebius", "verda"},
+			Spot:      true,
+			MaxNodes:  4,
+			// Lowercase fin-01 must still match Verda's FIN-01.
+			Regions: []string{"eu-north1", "fin-01"},
+		},
+	}
+	w.Tick(w.ctx)
+
+	// When Nebius refuses for lack of stock, the pool immediately buys from Verda.
+	nebius.RefuseCreates(providers.ErrQuota)
+	_, err := w.Provision(w.ctx, "spot-h100", anyMachine)
+	require.ErrorIs(t, err, providers.ErrQuota)
+	bought := w.buy("spot-h100")
+	require.Equal(t, "verda", bought.Provider)
+	require.Equal(t, "FIN-01", bought.Region)
+}
+
+// A pool that buys from two providers and names the regions of one of them
+// never buys from the other, and nothing else says so. It is warned about
+// once, until its regions let the other provider in.
+func TestAPoolWhoseRegionsLeaveOutOneOfItsProvidersIsWarnedAbout(t *testing.T) {
+	w := newWorld(t)
+	nebius := providers.NewFake("nebius", testOwner)
+	nebius.SetOffers(providers.Offer{
+		ID: "1gpu-h100", Provider: "nebius", Cloud: "nebius", Region: "eu-north1",
+		GPU: "H100", GPUCount: 1, CPUMillicores: 16_000, MemoryMB: 128_000,
+		HourlyCostMicros: 100 * microsPerCent, Spot: true,
+	})
+	w.verda.SetOffers(providers.Offer{
+		ID: "1H100.80S", Provider: "verda", Cloud: "verda", Region: "FIN-01",
+		GPU: "H100", GPUCount: 1, CPUMillicores: 20_000, MemoryMB: 128_000,
+		HourlyCostMicros: 268 * microsPerCent, Spot: true,
+	})
+	w.Provisioner = w.replica(func(opts *Options) { opts.Providers = providers.RegistryOf(w.verda, nebius) })
+	pool := types.WorkerPoolConfig{
+		GPUType: "H100",
+		Provisioning: types.WorkerPoolProvisioningConfig{
+			Providers: []string{"nebius", "verda"},
+			Spot:      true,
+			MaxNodes:  4,
+			Regions:   []string{"eu-north1"},
+		},
+	}
+	w.control.pools["spot-h100"] = pool
+
+	w.Tick(w.ctx)
+	require.Equal(t, map[string]bool{"spot-h100/verda": true}, w.regionWarned, "Verda sells the GPU, and nowhere the pool buys")
+	w.after(tickInterval)
+	require.Equal(t, map[string]bool{"spot-h100/verda": true}, w.regionWarned)
+
+	pool.Provisioning.Regions = []string{"eu-north1", "FIN-01"}
+	w.control.pools["spot-h100"] = pool
+	w.after(tickInterval)
+	require.Empty(t, w.regionWarned, "it would be warned about again, should its regions leave Verda out again")
+}
+
+func TestRunningAndRemovedPoolMachinesRecordIncrementalSpendToS2(t *testing.T) {
+	w, told := recordingOutcomes(t)
+	w.Tick(w.ctx)
+
+	machine := w.buy("spot-l40s")
+	// Still booting after 1 minute: one incremental spend window with Booted=false.
+	w.after(billEvery)
+	spends := told.spends(t)
+	require.Len(t, spends, 1, "still-running machine accrues spend before it ends")
+	require.Equal(t, watch.SourcePool, spends[0].Source)
+	require.Equal(t, "spot-l40s", spends[0].Pool)
+	require.Equal(t, machine.ID, spends[0].MachineID)
+	require.Equal(t, "verda", spends[0].Provider)
+	require.Equal(t, "FIN-01", spends[0].Region)
+	require.True(t, spends[0].Spot)
+	require.False(t, spends[0].Booted)
+	require.Equal(t, billEvery, spends[0].Duration)
+	require.Positive(t, spends[0].CostMicros)
+	require.Zero(t, spends[0].RevenueMicros)
+
+	// Worker joins, runs for 1 minute (incremental window with Booted=true), then
+	// is interrupted 30s later (residual window on removal).
+	w.workers.join(machine)
+	w.workers.work(machine, true)
+	w.after(billEvery)
+	w.verda.SetStatus(machine.InstanceID, providers.StatusInterrupted, "preempted")
+	w.after(30 * time.Second)
+
+	spends = told.spends(t)
+	require.Len(t, spends, 3)
+	require.True(t, spends[1].Booted)
+	require.Equal(t, billEvery, spends[1].Duration)
+	require.True(t, spends[2].Booted)
+	require.Equal(t, 30*time.Second, spends[2].Duration)
+	require.Equal(t, spends[0].From.Add(2*billEvery+30*time.Second), spends[2].At, "windows tile cleanly without gaps or overlap")
 }

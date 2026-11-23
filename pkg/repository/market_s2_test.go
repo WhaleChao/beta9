@@ -293,7 +293,8 @@ func TestS2IsNotUsedForTheMarketUnlessItIsConfigured(t *testing.T) {
 
 	log, err = NewS2MarketLog(types.S2Config{ApiKey: "key", Basin: "basin", StreamPrefix: "/staging/"})
 	require.NoError(t, err)
-	assert.Equal(t, s2.StreamName("staging/market/outcomes"), log.name(watch.Stream{Name: "outcomes"}))
+	assert.Equal(t, s2.StreamName("staging/market/outcomes"), log.name(watch.Streams{}.Outcomes()))
+	assert.Equal(t, s2.StreamName("staging/market/spend"), log.name(watch.Streams{}.Spend()))
 }
 
 // The sampler writes to S2 and the reader draws a chart from what it wrote:

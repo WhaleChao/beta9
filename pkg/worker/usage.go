@@ -34,6 +34,9 @@ type WorkerUsageMetrics struct {
 	usageRecorder       ContainerUsageRecorder
 	gpuType             string
 	poolMode            types.PoolMode
+	poolName            string
+	machineID           string
+	origin              types.WorkerOrigin
 	openMeterMetadata   bool
 	now                 func() time.Time
 	newTicker           func(time.Duration) (<-chan time.Time, func())
@@ -85,6 +88,19 @@ func NewWorkerUsageMetrics(
 		go wm.startBacklogDrain(ctx, usageBacklogDrainInterval)
 	}
 	return wm, nil
+}
+
+// SetAttribution records which pool, machine, and provider supplied this worker
+// so container usage and quoted revenue can be attributed to capacity sources.
+// machineID is the agent's machine, which a worker on a cluster node has none
+// of. It is not synchronized: call it before the worker runs containers.
+func (wm *WorkerUsageMetrics) SetAttribution(poolName, machineID string, origin types.WorkerOrigin) {
+	if wm == nil {
+		return
+	}
+	wm.poolName = strings.TrimSpace(poolName)
+	wm.machineID = strings.TrimSpace(machineID)
+	wm.origin = origin
 }
 
 // EmitContainerUsage binds a quote to each interval start. Once an end is
@@ -441,6 +457,29 @@ func (wm *WorkerUsageMetrics) containerMetricLabels(interval containerUsageInter
 		"gpu_count":       interval.request.GpuCount,
 		"duration_ms":     interval.duration.Milliseconds(),
 		"pricing_version": interval.quote.PricingVersion,
+	}
+	if wm.poolName != "" {
+		labels["pool_name"] = wm.poolName
+	}
+	if wm.machineID != "" {
+		labels["machine_id"] = wm.machineID
+	}
+	if wm.origin.CapacitySource != "" {
+		labels["capacity_source"] = wm.origin.CapacitySource
+	}
+	if wm.origin.Provider != "" {
+		labels["provider"] = wm.origin.Provider
+	}
+	if wm.origin.Cloud != "" {
+		labels["cloud"] = wm.origin.Cloud
+	}
+	if wm.origin.Region != "" {
+		labels["region"] = wm.origin.Region
+	}
+	// Whether the machine may be taken back is known only of one whose
+	// provider is: a cluster pool may run on spot nodes too.
+	if wm.origin.Provider != "" {
+		labels["spot"] = wm.origin.Spot
 	}
 	if wm.openMeterMetadata {
 		labels["interval_start"] = interval.start.Format(time.RFC3339Nano)

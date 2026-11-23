@@ -1097,3 +1097,73 @@ func TestEmitContainerUsageSkipsPlatformWorkloads(t *testing.T) {
 		}
 	}
 }
+
+func TestContainerMetricLabelsIncludePoolAndProviderAttribution(t *testing.T) {
+	wm := &WorkerUsageMetrics{workerId: "worker-1", gpuType: "H100"}
+	wm.SetAttribution("spot-h100-capacity", "machine-42", types.WorkerOrigin{
+		CapacitySource: "provisioned",
+		Provider:       "verda",
+		Cloud:          "verda",
+		Region:         "FIN-01",
+		Offer:          "1H100.80S",
+		Spot:           true,
+	})
+
+	labels := wm.containerMetricLabels(containerUsageInterval{
+		request: types.ContainerRequest{
+			ContainerId: "c-1",
+			WorkspaceId: "ws-1",
+			Gpu:         "H100",
+			GpuCount:    1,
+		},
+		duration: 5 * time.Second,
+	})
+
+	if labels["pool_name"] != "spot-h100-capacity" ||
+		labels["machine_id"] != "machine-42" ||
+		labels["capacity_source"] != "provisioned" ||
+		labels["provider"] != "verda" ||
+		labels["cloud"] != "verda" ||
+		labels["region"] != "FIN-01" ||
+		labels["spot"] != true {
+		t.Fatalf("unexpected attribution labels: %#v", labels)
+	}
+
+	// A worker on a cluster node has no agent machine, and nothing is on
+	// record of who sold the node or on what terms: none of it is guessed.
+	wm.SetAttribution("default", "", resolveWorkerOrigin(types.PoolModeLocal, nil))
+	labels = wm.containerMetricLabels(containerUsageInterval{request: types.ContainerRequest{ContainerId: "c-2"}})
+	if labels["pool_name"] != "default" || labels["capacity_source"] != types.CapacitySourceCluster {
+		t.Fatalf("unexpected cluster attribution labels: %#v", labels)
+	}
+	for _, unknown := range []string{"machine_id", "provider", "cloud", "region", "spot"} {
+		if _, said := labels[unknown]; said {
+			t.Fatalf("a cluster worker's usage says %q, which is not known: %#v", unknown, labels)
+		}
+	}
+}
+
+func TestResolveWorkerOriginPrefersWhatTheControlPlaneSaid(t *testing.T) {
+	provisioned := &types.WorkerOrigin{CapacitySource: types.CapacitySourceProvisioned, Provider: "verda", Region: "FIN-01", Spot: true}
+	if got := resolveWorkerOrigin(types.PoolModeExternal, provisioned); got != *provisioned {
+		t.Fatalf("got %#v, want what the control plane said", got)
+	}
+	// The control plane may have nothing on record, and says so with an
+	// origin that names no source. The worker does not put one in its place.
+	if got := resolveWorkerOrigin(types.PoolModeExternal, &types.WorkerOrigin{}); got != (types.WorkerOrigin{}) {
+		t.Fatalf("got %#v, want nothing said where the control plane said nothing", got)
+	}
+	for mode, want := range map[types.PoolMode]string{
+		// Whether a machine of an external pool was bought for it is the
+		// control plane's to say. One from before it did is not guessed at.
+		types.PoolModeExternal: "",
+		types.PoolModePrivate:  types.CapacitySourcePrivate,
+		types.PoolModeProvider: types.CapacitySourceProvider,
+		types.PoolModeLocal:    types.CapacitySourceCluster,
+		"":                     types.CapacitySourceCluster,
+	} {
+		if got := resolveWorkerOrigin(mode, nil); got != (types.WorkerOrigin{CapacitySource: want}) {
+			t.Fatalf("mode %q: got %#v, want only the capacity source %q", mode, got, want)
+		}
+	}
+}

@@ -235,13 +235,67 @@ func TestHydrateManagedWorkerMetering(t *testing.T) {
 		ContainerCostHookConfig: types.ContainerCostHookConfig{Endpoint: "https://billing.example.com/quote", Token: "quote-key"},
 	}
 	meteringJSON, _ := json.Marshal(metering)
-	err := hydrateManagedWorkerMetering(context.Background(), "worker-1", &config, types.WorkerPoolConfig{
+	origin, err := hydrateManagedWorkerMetering(context.Background(), "worker-1", &config, types.WorkerPoolConfig{
 		Mode: types.PoolModeExternal,
 	}, &fakeWorkerRepoClient{metering: &pb.GetWorkerMeteringConfigResponse{Ok: true, MeteringJson: string(meteringJSON)}})
 
 	require.NoError(t, err)
+	require.Nil(t, origin)
 	metering.ContainerMetricsInterval = 3 * time.Second
 	require.Equal(t, metering, config.Monitoring, "the vended metering joins the worker's local settings")
+
+	t.Run("hydrates provider origin without VictoriaMetrics", func(t *testing.T) {
+		cfg := types.AppConfig{Monitoring: types.MonitoringConfig{MetricsCollector: string(types.MetricsCollectorNone), ContainerMetricsInterval: 3 * time.Second}}
+		payload := types.WorkerMeteringPayload{
+			MonitoringConfig: types.MonitoringConfig{
+				MetricsCollector:        string(types.MetricsCollectorOpenMeter),
+				OpenMeter:               types.OpenMeterConfig{ServerUrl: "https://meter.example.com", ApiKey: "meter-key"},
+				ContainerCostHookConfig: types.ContainerCostHookConfig{Endpoint: "https://billing.example.com/quote", Token: "quote-key"},
+			},
+			Origin: &types.WorkerOrigin{
+				CapacitySource: "provisioned",
+				Provider:       "verda",
+				Cloud:          "verda",
+				Region:         "FIN-01",
+				Offer:          "1H100.80S",
+				Spot:           true,
+			},
+		}
+		raw, err := json.Marshal(payload)
+		require.NoError(t, err)
+
+		gotOrigin, err := hydrateManagedWorkerMetering(context.Background(), "worker-1", &cfg, types.WorkerPoolConfig{
+			Mode: types.PoolModeExternal,
+		}, &fakeWorkerRepoClient{metering: &pb.GetWorkerMeteringConfigResponse{Ok: true, MeteringJson: string(raw)}})
+		require.NoError(t, err)
+		require.Equal(t, payload.Origin, gotOrigin)
+		require.Equal(t, types.VictoriaMetricsConfig{}, cfg.Monitoring.VictoriaMetrics)
+	})
+
+	// A worker on a machine the platform does not control holds a private
+	// worker token, which the gateway refuses here. It does not ask: it stays
+	// unmetered, and what it ran is billed from the control plane's records.
+	t.Run("workers that are not trusted do not ask", func(t *testing.T) {
+		for _, mode := range []types.PoolMode{types.PoolModePrivate, types.PoolModeProvider} {
+			cfg := types.AppConfig{Monitoring: types.MonitoringConfig{MetricsCollector: string(types.MetricsCollectorNone)}}
+			origin, err := hydrateManagedWorkerMetering(context.Background(), "worker-1", &cfg, types.WorkerPoolConfig{Mode: mode}, neverAskedForMetering{t: t})
+			require.NoError(t, err)
+			require.Nil(t, origin)
+			require.False(t, cfg.Monitoring.Metered())
+		}
+	})
+}
+
+// neverAskedForMetering fails the test of a worker that asks the gateway for
+// its metering config.
+type neverAskedForMetering struct {
+	pb.WorkerRepositoryServiceClient
+	t *testing.T
+}
+
+func (c neverAskedForMetering) GetWorkerMeteringConfig(context.Context, *pb.GetWorkerMeteringConfigRequest, ...grpc.CallOption) (*pb.GetWorkerMeteringConfigResponse, error) {
+	c.t.Fatal("a worker that is not trusted asked for the control plane's metering config")
+	return nil, nil
 }
 
 func (f *fakeWorkerRepoClient) GetWorkerServiceProxyConfig(context.Context, *pb.GetWorkerServiceProxyConfigRequest, ...grpc.CallOption) (*pb.GetWorkerServiceProxyConfigResponse, error) {

@@ -84,10 +84,27 @@ type Outcome struct {
 	// HourlyMicros is what the provider charged for the machine an hour.
 	HourlyMicros int64 `json:"micros,omitempty"`
 
+	// MachineID identifies the bought machine across create, active, and end
+	// outcomes so lifecycle records can be joined without timestamp heuristics.
+	MachineID string `json:"machine_id,omitempty"`
+	// Pool is the control-plane pool name for SourcePool outcomes. Omitted for
+	// tenant reservations.
+	Pool string `json:"pool,omitempty"`
+
+	// Booted records on OutcomeEnd whether the machine ever came up before
+	// ending. Nil on legacy records written before this field existed.
+	Booted *bool `json:"booted,omitempty"`
+
 	// Took is how long the provider took to answer, for a purchase; how
 	// long the machine took to come up, once it has; and how long the
 	// machine was had, at its end.
 	Took time.Duration `json:"-"`
+	// Boot is how long the machine took to come up, repeated on OutcomeEnd
+	// when Booted is true so end records are self-contained.
+	Boot time.Duration `json:"-"`
+	// Ran is how long the machine ran after coming up, set on OutcomeEnd when
+	// Booted is true.
+	Ran time.Duration `json:"-"`
 	// Err is the start of what the provider said, when it refused.
 	Err string `json:"err,omitempty"`
 }
@@ -97,6 +114,8 @@ type outcomeWire struct {
 	TS int64 `json:"ts"`
 	outcomeFields
 	TookMS int64 `json:"took_ms,omitempty"`
+	BootMS int64 `json:"boot_ms,omitempty"`
+	RanMS  int64 `json:"ran_ms,omitempty"`
 }
 
 // outcomeFields is Outcome without its methods, so that writing one does not
@@ -104,7 +123,14 @@ type outcomeWire struct {
 type outcomeFields Outcome
 
 func (o Outcome) MarshalJSON() ([]byte, error) {
-	return json.Marshal(outcomeWire{V: recordVersion, TS: o.At.UnixMilli(), outcomeFields: outcomeFields(o), TookMS: o.Took.Milliseconds()})
+	return json.Marshal(outcomeWire{
+		V:             recordVersion,
+		TS:            o.At.UnixMilli(),
+		outcomeFields: outcomeFields(o),
+		TookMS:        o.Took.Milliseconds(),
+		BootMS:        o.Boot.Milliseconds(),
+		RanMS:         o.Ran.Milliseconds(),
+	})
 }
 
 func (o *Outcome) UnmarshalJSON(data []byte) error {
@@ -115,6 +141,8 @@ func (o *Outcome) UnmarshalJSON(data []byte) error {
 	*o = Outcome(in.outcomeFields)
 	o.At = time.UnixMilli(in.TS).UTC()
 	o.Took = time.Duration(in.TookMS) * time.Millisecond
+	o.Boot = time.Duration(in.BootMS) * time.Millisecond
+	o.Ran = time.Duration(in.RanMS) * time.Millisecond
 	return nil
 }
 
@@ -170,6 +198,23 @@ func (o Outcome) Ended(result string, had time.Duration) Outcome {
 	return o
 }
 
+// EndedAfter is the outcome of the machine's end, recording whether it ever
+// came up, how long it took to boot (when known), and how long it ran after
+// coming up (when known).
+func (o Outcome) EndedAfter(result string, had, boot, ran time.Duration, booted bool) Outcome {
+	o.Event, o.Result, o.Took = OutcomeEnd, result, had
+	b := booted
+	o.Booted = &b
+	if booted {
+		o.Boot = max(0, boot)
+		o.Ran = max(0, ran)
+	} else {
+		o.Boot = 0
+		o.Ran = 0
+	}
+	return o
+}
+
 // outcomesHeld is how many outcomes wait to be written before more are
 // dropped. A machine is bought far less often than this fills.
 const outcomesHeld = 1024
@@ -184,11 +229,14 @@ const outcomesAtOnce = 100
 //
 // A nil Recorder records nothing.
 type Recorder struct {
-	log     Log
-	stream  Stream
-	clock   common.Clock
-	queue   chan Outcome
-	dropped atomic.Int64
+	log          Log
+	stream       Stream
+	spendStream  Stream
+	clock        common.Clock
+	queue        chan Outcome
+	spendQueue   chan Spend
+	dropped      atomic.Int64
+	spendDropped atomic.Int64
 }
 
 // NewRecorder returns a recorder that writes to log, or nil when there is no
@@ -197,7 +245,14 @@ func NewRecorder(log Log, streams Streams, clock common.Clock) *Recorder {
 	if log == nil {
 		return nil
 	}
-	return &Recorder{log: log, stream: streams.Outcomes(), clock: common.ClockOrReal(clock), queue: make(chan Outcome, outcomesHeld)}
+	return &Recorder{
+		log:         log,
+		stream:      streams.Outcomes(),
+		spendStream: streams.Spend(),
+		clock:       common.ClockOrReal(clock),
+		queue:       make(chan Outcome, outcomesHeld),
+		spendQueue:  make(chan Spend, spendHeld),
+	}
 }
 
 // Record takes note of an outcome, at the present time unless it says when.
@@ -234,8 +289,8 @@ func (r *Recorder) Read(ctx context.Context, from, to time.Time) ([]Outcome, err
 	return outcomes, err
 }
 
-// Start writes the outcomes that are recorded until ctx is done. It returns
-// at once.
+// Start writes the outcomes and spend records that are recorded until ctx is
+// done. It returns at once.
 func (r *Recorder) Start(ctx context.Context) {
 	if r == nil {
 		return
@@ -247,6 +302,8 @@ func (r *Recorder) Start(ctx context.Context) {
 				return
 			case first := <-r.queue:
 				r.Flush(ctx, first)
+			case first := <-r.spendQueue:
+				r.FlushSpend(ctx, first)
 			}
 		}
 	}()

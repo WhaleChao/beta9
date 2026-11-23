@@ -89,6 +89,7 @@ type Gateway struct {
 	workerRepo           repository.WorkerRepository
 	DefaultStorageClient *clients.StorageClient
 	Scheduler            *scheduler.Scheduler
+	provisionerStore     *provisioner.Store
 	market               providerMarket
 	ctx                  context.Context
 	cancelFunc           context.CancelFunc
@@ -228,11 +229,13 @@ func NewGateway() (*Gateway, error) {
 
 	// Pools with a provisioning block buy their machines through this. The
 	// scheduler is given it before the compute service loads any pool.
+	provisionerStore := provisioner.NewStore(redisClient)
+	gateway.provisionerStore = provisionerStore
 	machineProvisioner := provisioner.New(provisioner.Options{
 		Providers:    providerRegistry,
 		ControlPlane: gateway.ComputeService,
 		Workers:      workerRepo,
-		Store:        provisioner.NewStore(redisClient),
+		Store:        provisionerStore,
 		Limits: provisioner.Limits{
 			MaxHourlyCents: config.Providers.MaxHourlyCents,
 			MaxDailyCents:  config.Providers.MaxDailyCents,
@@ -489,6 +492,9 @@ func gatewayOutgoingHeaderMatcher(key string) (string, bool) {
 // Register repository services
 func (g *Gateway) registerRepositoryServices() error {
 	wr := repositoryservices.NewWorkerRepositoryService(g.ctx, g.workerRepo, g.ContainerRepo, g.BackendRepo, g.ComputeRepo, g.ComputeService, g.EventRepo, g.RedisClient, g.Config, g.Config.Cache.Coordinator.Token, g.Scheduler.WorkerHoldsPoolHeadroom)
+	if g.provisionerStore != nil {
+		wr.SetMachineOriginLookup(g.provisionerStore.Origin)
+	}
 	pb.RegisterWorkerRepositoryServiceServer(g.grpcServer, wr)
 
 	cr := repositoryservices.NewContainerRepositoryService(g.ctx, g.ContainerRepo)

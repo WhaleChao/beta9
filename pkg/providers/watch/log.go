@@ -69,3 +69,11 @@ func (s Streams) Series(gpu string, tier Tier) Stream {
 func (s Streams) Outcomes() Stream {
 	return Stream{Name: "outcomes"}
 }
+
+// Spend is the stream of incremental provider spend windows for bought
+// machines, emitted as machines run and when they close so spend can be
+// summed including still-running machines. Like the outcomes, it is kept for
+// good: a stream without a Keep is made with infinite retention.
+func (s Streams) Spend() Stream {
+	return Stream{Name: "spend"}
+}

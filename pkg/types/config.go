@@ -1364,6 +1364,54 @@ type MonitoringConfig struct {
 	ContainerCostHookConfig  ContainerCostHookConfig `key:"containerCostHook" json:"container_cost_hook"`
 }
 
+// The capacity sources of a WorkerOrigin: who supplied the machine a worker
+// runs on.
+const (
+	// CapacitySourceProvisioned is a machine the control plane bought for a
+	// pool that has a provisioning block. Only such a machine has a provider,
+	// region and offer on record.
+	CapacitySourceProvisioned = "provisioned"
+	// CapacitySourceExternal is a machine that joined a pool in external mode
+	// through the agent, and was not bought for it. Only the control plane
+	// can tell it from one that was, so only the control plane says so.
+	CapacitySourceExternal = "external"
+	// CapacitySourcePrivate is a machine of a tenant's private pool.
+	CapacitySourcePrivate = "private"
+	// CapacitySourceProvider is a machine a workspace contributes to a
+	// provider pool.
+	CapacitySourceProvider = "provider"
+	// CapacitySourceCluster is a node of the control plane's own cluster.
+	CapacitySourceCluster = "cluster"
+)
+
+// WorkerOrigin describes where a worker's underlying machine came from, so
+// usage events can be attributed back to the provider, region, and capacity
+// source that supplied the machine. Everything but CapacitySource is empty
+// unless the machine was provisioned, and all of it is where the control
+// plane could not say.
+//
+// It holds no price and no credential. A worker repeats it on the usage it
+// reports, which makes it as good as that worker's word: the record to hold
+// it against is the market's history, which only the control plane writes
+// and which names the same machine.
+type WorkerOrigin struct {
+	CapacitySource string `json:"capacity_source,omitempty"`
+	Provider       string `json:"provider,omitempty"`
+	Cloud          string `json:"cloud,omitempty"`
+	Region         string `json:"region,omitempty"`
+	Offer          string `json:"offer,omitempty"`
+	Spot           bool   `json:"spot,omitempty"`
+}
+
+// WorkerMeteringPayload is the JSON body returned by GetWorkerMeteringConfig.
+// MonitoringConfig is embedded so older workers (which unmarshal directly into
+// MonitoringConfig) and older gateways (which marshal MonitoringConfig) remain
+// wire-compatible in both upgrade directions.
+type WorkerMeteringPayload struct {
+	MonitoringConfig
+	Origin *WorkerOrigin `json:"origin,omitempty"`
+}
+
 // Metering is the part of a monitoring config that records and prices
 // container usage: the collector with its credentials and the cost hook. A
 // control-plane managed worker boots without one and receives the control

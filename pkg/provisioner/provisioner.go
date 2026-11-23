@@ -163,6 +163,7 @@ type Provisioner struct {
 	// been said since the pool last bought one. Each is said once.
 	said         map[string][]string
 	unconfigured map[string]bool // providers already warned about
+	regionWarned map[string]bool // pool/provider pairs warned about region mismatch
 	sweptAll     time.Time
 }
 
@@ -211,6 +212,7 @@ func New(opts Options) *Provisioner {
 		backoff:      map[string]time.Time{},
 		said:         map[string][]string{},
 		unconfigured: map[string]bool{},
+		regionWarned: map[string]bool{},
 	}
 }
 
@@ -387,7 +389,7 @@ func (p *Provisioner) refused(ctx context.Context, machine Machine, err error) {
 // recordInstance writes down the instance the provider answered with, and
 // returns the machine as the scheduler is told about it.
 func (p *Provisioner) recordInstance(ctx context.Context, machine Machine, instance providers.Instance) (*scheduler.ProvisionedMachine, error) {
-	bought, err := p.store.Update(ctx, machine.ID, func(record *Machine) { record.InstanceID = instance.ID })
+	bought, err := p.updateMachine(ctx, machine.ID, func(record *Machine) { record.InstanceID = instance.ID })
 	if errors.Is(err, errNoRecord) {
 		// The tick gave up on the purchase while it was under way. The
 		// instance has no record now, and the next tick deletes it.
@@ -598,7 +600,7 @@ func (p *Provisioner) forgetRecentRecords() {
 // abandon undoes a purchase the provider refused: nothing was bought.
 func (p *Provisioner) abandon(ctx context.Context, machine Machine) {
 	p.forget(ctx, machine)
-	if err := p.store.Remove(ctx, machine.ID, p.clock.Now()); err != nil {
+	if err := p.removeMachine(ctx, machine.ID, p.clock.Now()); err != nil {
 		// The tick removes it once the purchase is old enough to give up on.
 		machineLog(log.Warn(), machine).Err(err).Msg("provisioner: could not remove the record of a machine that was not bought")
 	}
@@ -759,6 +761,8 @@ func (m Machine) offer() providers.Offer {
 func (m Machine) outcome(now time.Time) watch.Outcome {
 	outcome := watch.OutcomeOf(m.offer())
 	outcome.Source = watch.SourcePool
+	outcome.MachineID = m.ID
+	outcome.Pool = m.Pool
 	outcome.At = now
 	return outcome
 }
@@ -1085,10 +1089,16 @@ func sells(offer providers.Offer, pool types.WorkerPoolConfig) bool {
 	return (offer.Spot == buying.Spot || (!offer.Spot && buying.OnDemand)) &&
 		strings.EqualFold(offer.GPU, strings.TrimSpace(pool.GPUType)) &&
 		(offer.GPUCount > 0) == (offer.GPU != "") &&
-		(len(buying.Regions) == 0 || slices.Contains(buying.Regions, offer.Region)) &&
+		(len(buying.Regions) == 0 || containsRegion(buying.Regions, offer.Region)) &&
 		// Without a price there is no telling what it does to the caps.
 		offer.HourlyCostMicros > 0 &&
 		(buying.MaxNodeHourlyCents <= 0 || offer.HourlyCostMicros <= buying.MaxNodeHourlyCents*microsPerCent)
+}
+
+func containsRegion(regions []string, region string) bool {
+	return slices.ContainsFunc(regions, func(allowed string) bool {
+		return strings.EqualFold(strings.TrimSpace(allowed), region)
+	})
 }
 
 // holds reports whether a machine bought from the offer has room for need.
@@ -1156,11 +1166,50 @@ func (p *Provisioner) refresh(ctx context.Context) {
 		spent, err := p.store.Spent(ctx, now)
 		if err != nil {
 			log.Warn().Err(err).Msg("provisioner: could not read what was spent on machines")
-			return
+		} else {
+			p.mu.Lock()
+			p.spentToday = spent
+			p.mu.Unlock()
 		}
-		p.mu.Lock()
-		p.spentToday = spent
-		p.mu.Unlock()
+	}
+
+	p.warnRegionMismatches()
+}
+
+// warnRegionMismatches logs once per pool/provider pair when a multi-provider
+// pool's regions list excludes every GPU-matching offer from a configured
+// provider (for example, pinning a Nebius region after adding Verda).
+func (p *Provisioner) warnRegionMismatches() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for poolName, config := range p.pools {
+		if len(config.Provisioning.Regions) == 0 || len(config.Provisioning.Providers) < 2 {
+			continue
+		}
+		anywhereConfig := config
+		anywhereConfig.Provisioning.Regions = nil
+		for _, providerName := range config.Provisioning.Providers {
+			list, listed := p.offers[providerName]
+			if !listed || len(list.offers) == 0 {
+				continue
+			}
+			key := poolName + "/" + providerName
+			if len(selling(list.offers, config)) > 0 {
+				delete(p.regionWarned, key)
+				continue
+			}
+			anywhere := selling(list.offers, anywhereConfig)
+			if len(anywhere) == 0 || p.regionWarned[key] {
+				continue
+			}
+			p.regionWarned[key] = true
+			log.Warn().
+				Str("pool_name", poolName).
+				Str("provider", providerName).
+				Strs("configured_regions", config.Provisioning.Regions).
+				Strs("available_regions", regionsOf(anywhere)).
+				Msg("provisioner: pool regions exclude all offers from configured provider")
+		}
 	}
 }
 
@@ -1279,7 +1328,7 @@ func (p *Provisioner) vouch(ctx context.Context) {
 		if _, buys := known.buys(machine); !buys {
 			continue
 		}
-		if _, err := p.store.Update(ctx, machine.ID, func(record *Machine) { record.PoolGoneSince = time.Time{} }); err != nil && !errors.Is(err, errNoRecord) {
+		if _, err := p.updateMachine(ctx, machine.ID, func(record *Machine) { record.PoolGoneSince = time.Time{} }); err != nil && !errors.Is(err, errNoRecord) {
 			machineLog(log.Warn(), machine).Err(err).Msg("provisioner: could not keep a machine whose pool exists")
 		}
 	}
@@ -1686,7 +1735,7 @@ func (p *Provisioner) reconcileMachine(ctx context.Context, machine Machine, s s
 	}
 
 	if !reflect.DeepEqual(next, machine) {
-		if _, err := p.store.Update(ctx, machine.ID, func(record *Machine) { record.take(next) }); err != nil {
+		if _, err := p.updateMachine(ctx, machine.ID, func(record *Machine) { record.take(next) }); err != nil {
 			machineLog(log.Warn(), machine).Err(err).Msg("provisioner: could not update a machine's record")
 			return
 		}
@@ -1761,7 +1810,14 @@ func (p *Provisioner) recordEnd(ctx context.Context, machine Machine, now time.T
 	if machine.Release.End == "" {
 		return
 	}
-	p.learn(ctx, machine.outcome(now).Ended(machine.Release.End, now.Sub(machine.CreatedAt)))
+	booted := !machine.ReadyAt.IsZero()
+	var boot, ran time.Duration
+	if booted {
+		boot = machine.ReadyAt.Sub(machine.CreatedAt)
+		ran = now.Sub(machine.ReadyAt)
+	}
+	ended := machine.outcome(now).EndedAfter(machine.Release.End, now.Sub(machine.CreatedAt), boot, ran, booted)
+	p.learn(ctx, ended)
 }
 
 // finishRelease gives a machine back: the gateway forgets it, its provider
@@ -1793,7 +1849,7 @@ func (p *Provisioner) finishRelease(ctx context.Context, machine Machine, now ti
 	}
 	// The machine is paid for until now. Should its record stay, it is paid
 	// for until the record goes: there is no telling since when it is gone.
-	if err := p.store.Remove(ctx, machine.ID, now); err != nil {
+	if err := p.removeMachine(ctx, machine.ID, now); err != nil {
 		machineLog(log.Warn(), machine).Err(err).Msg("provisioner: could not remove the record of a machine that is gone")
 		return
 	}
@@ -1936,6 +1992,42 @@ func (s *Store) Reserve(ctx context.Context, newRecord func(held []Machine) (Mac
 	return reserved, err
 }
 
+type billedSlice struct {
+	machine Machine
+	from    time.Time
+	until   time.Time
+	cents   float64
+}
+
+func (b billedSlice) valid() bool {
+	return b.machine.InstanceID != "" && b.until.After(b.from)
+}
+
+func (p *Provisioner) updateMachine(ctx context.Context, id string, change func(*Machine)) (Machine, error) {
+	updated, billed, err := p.store.update(ctx, id, change)
+	if err == nil && billed.valid() {
+		p.recordSpend(billed)
+	}
+	return updated, err
+}
+
+func (p *Provisioner) removeMachine(ctx context.Context, id string, until time.Time) error {
+	billed, err := p.store.remove(ctx, id, until)
+	if err == nil && billed.valid() {
+		p.recordSpend(billed)
+	}
+	return err
+}
+
+func (p *Provisioner) recordSpend(billed billedSlice) {
+	if p.outcomes == nil || !billed.valid() {
+		return
+	}
+	costMicros := int64(math.Round(billed.cents * microsPerCent))
+	spend := watch.SpendOf(billed.machine.outcome(billed.until), billed.from, billed.until, costMicros, 0, !billed.machine.ReadyAt.IsZero())
+	p.outcomes.RecordSpend(spend)
+}
+
 // Update changes one record and returns it as it is now. It fails with
 // errNoRecord when the record is gone.
 //
@@ -1943,7 +2035,13 @@ func (s *Store) Reserve(ctx context.Context, newRecord func(held []Machine) (Mac
 // as spent. The record and the spend are written in one transaction: a write
 // that fails has counted nothing, and one that succeeds has counted it once.
 func (s *Store) Update(ctx context.Context, id string, change func(*Machine)) (Machine, error) {
+	updated, _, err := s.update(ctx, id, change)
+	return updated, err
+}
+
+func (s *Store) update(ctx context.Context, id string, change func(*Machine)) (Machine, billedSlice, error) {
 	var updated Machine
+	var billed billedSlice
 	err := s.lock.WithLease(ctx, common.RedisKeys.ComputeProvisionedLock(), writeLock, func(ctx context.Context) error {
 		stored, err := s.get(ctx, id)
 		if err != nil {
@@ -1951,16 +2049,25 @@ func (s *Store) Update(ctx context.Context, id string, change func(*Machine)) (M
 		}
 		updated = stored
 		change(&updated)
-		return s.save(ctx, updated, updated.cost(stored.billedFrom(), updated.BilledUntil))
+		from := stored.billedFrom()
+		cents := updated.cost(from, updated.BilledUntil)
+		billed = billedSlice{machine: updated, from: from, until: updated.BilledUntil, cents: cents}
+		return s.save(ctx, updated, cents)
 	})
-	return updated, err
+	return updated, billed, err
 }
 
 // Remove deletes a record and, in the same transaction, counts what its
 // machine cost since it was last billed, up to until, as spent. Removing a
 // record that is gone is not an error, and counts nothing.
 func (s *Store) Remove(ctx context.Context, id string, until time.Time) error {
-	return s.lock.WithLease(ctx, common.RedisKeys.ComputeProvisionedLock(), writeLock, func(ctx context.Context) error {
+	_, err := s.remove(ctx, id, until)
+	return err
+}
+
+func (s *Store) remove(ctx context.Context, id string, until time.Time) (billedSlice, error) {
+	var billed billedSlice
+	err := s.lock.WithLease(ctx, common.RedisKeys.ComputeProvisionedLock(), writeLock, func(ctx context.Context) error {
 		machine, err := s.get(ctx, id)
 		if errors.Is(err, errNoRecord) {
 			return nil
@@ -1968,13 +2075,41 @@ func (s *Store) Remove(ctx context.Context, id string, until time.Time) error {
 		if err != nil {
 			return err
 		}
+		from := machine.billedFrom()
+		cents := machine.cost(from, until)
+		billed = billedSlice{machine: machine, from: from, until: until, cents: cents}
 		_, err = s.rdb.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 			pipe.HDel(ctx, common.RedisKeys.ComputeProvisionedMachines(), id)
-			addSpend(ctx, pipe, until, machine.cost(machine.billedFrom(), until))
+			addSpend(ctx, pipe, until, cents)
 			return nil
 		})
 		return err
 	})
+	return billed, err
+}
+
+// Origin returns the provider provenance for a provisioned machine, or nil
+// when the machine is not in the provisioned store.
+func (s *Store) Origin(ctx context.Context, id string) (*types.WorkerOrigin, error) {
+	if s == nil || strings.TrimSpace(id) == "" {
+		return nil, nil
+	}
+	machine, err := s.get(ctx, id)
+	if errors.Is(err, errNoRecord) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	outcome := watch.OutcomeOf(machine.offer())
+	return &types.WorkerOrigin{
+		CapacitySource: types.CapacitySourceProvisioned,
+		Provider:       machine.Provider,
+		Cloud:          cmp.Or(machine.Cloud, machine.Provider),
+		Region:         machine.Region,
+		Offer:          outcome.Offer,
+		Spot:           machine.Spot,
+	}, nil
 }
 
 func (s *Store) get(ctx context.Context, id string) (Machine, error) {

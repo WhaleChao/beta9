@@ -9502,6 +9502,18 @@ func outcomesOf(t *testing.T, service *Service, log *watch.MemoryLog) []watch.Ou
 	return outcomes
 }
 
+func spendsOf(t *testing.T, service *Service, log *watch.MemoryLog) []watch.Spend {
+	t.Helper()
+	service.outcomes.FlushSpend(context.Background())
+	var spends []watch.Spend
+	for _, record := range log.All("spend") {
+		var spend watch.Spend
+		require.NoError(t, json.Unmarshal(record.Body, &spend))
+		spends = append(spends, spend)
+	}
+	return spends
+}
+
 func recordOutcomes(service *Service) *watch.MemoryLog {
 	log := watch.NewMemoryLog()
 	service.outcomes = watch.NewRecorder(log, watch.Streams{}, nil)
@@ -9617,7 +9629,10 @@ func TestAMachineThatAFailedLaunchGivesBackHasAnEndInTheMarketsHistory(t *testin
 	require.Equal(t, watch.ResultReleased, ended.Result, "it is not held against its provider")
 	require.Equal(t, watch.SourceReservation, ended.Source)
 	require.GreaterOrEqual(t, ended.Took, time.Duration(0))
-	ended.At, ended.Event, ended.Result, ended.Took = purchases[0].At, purchases[0].Event, purchases[0].Result, purchases[0].Took
+	require.NotNil(t, ended.Booted)
+	require.False(t, *ended.Booted)
+	ended.At, ended.Event, ended.Result, ended.Took, ended.Booted, ended.Boot, ended.Ran =
+		purchases[0].At, purchases[0].Event, purchases[0].Result, purchases[0].Took, nil, 0, 0
 	require.Equal(t, purchases[0], ended, "it says the same of what the machine was bought as")
 }
 
@@ -9690,4 +9705,164 @@ func TestAMachineATenantGivesBackIsNotHeldAgainstItsProvider(t *testing.T) {
 	} {
 		require.Equal(t, result, reservationEnd(reason), reason)
 	}
+}
+
+func TestReservationOutcomesTrackMachineIDBootedRanAndBootTimeoutNeverUp(t *testing.T) {
+	t.Run("active then interrupted records boot and post-spinup ran duration", func(t *testing.T) {
+		m := newBoughtMachine(t)
+		m.state.Reservations[0].Spot = true
+		m.state.Reservations[0].CreatedAt = m.now
+		log := recordOutcomes(m.service)
+
+		m.provider.SetStatus(m.instance, providers.StatusActive, "")
+		res := m.check(t, 2*time.Minute)
+		require.Equal(t, model.ReservationActive, res.Status)
+		require.Equal(t, m.now, res.ActivatedAt)
+
+		m.provider.SetStatus(m.instance, providers.StatusInterrupted, "preempted")
+		res = m.check(t, 30*time.Minute)
+		require.Equal(t, model.ReservationInterrupted, res.Status)
+
+		outcomes := outcomesOf(t, m.service, log)
+		require.Len(t, outcomes, 2)
+		up, ended := outcomes[0], outcomes[1]
+		require.Equal(t, watch.OutcomeActive, up.Event)
+		require.Equal(t, res.MachineID, up.MachineID)
+		require.Equal(t, 2*time.Minute, up.Took)
+
+		require.Equal(t, watch.OutcomeEnd, ended.Event)
+		require.Equal(t, watch.ResultInterrupted, ended.Result)
+		require.Equal(t, res.MachineID, ended.MachineID)
+		require.NotNil(t, ended.Booted)
+		require.True(t, *ended.Booted)
+		require.Equal(t, 2*time.Minute, ended.Boot)
+		require.Equal(t, 30*time.Minute, ended.Ran)
+		require.Equal(t, 32*time.Minute, ended.Took)
+	})
+
+	t.Run("pending boot timeout records never_up with booted false", func(t *testing.T) {
+		m := newBoughtMachine(t)
+		m.state.Reservations[0].CreatedAt = m.now
+		m.service.appConfig.ManagedCompute.Reservations.BootTimeout = types.Duration(3 * time.Minute)
+		log := recordOutcomes(m.service)
+
+		res := m.check(t, 3*time.Minute)
+		require.Equal(t, model.ReservationDeleted, res.Status)
+		require.Equal(t, reconcileReasonLaunchFailed, res.TerminatingReason)
+
+		outcomes := outcomesOf(t, m.service, log)
+		require.Len(t, outcomes, 1)
+		ended := outcomes[0]
+		require.Equal(t, watch.OutcomeEnd, ended.Event)
+		require.Equal(t, watch.ResultNeverUp, ended.Result)
+		require.Equal(t, res.MachineID, ended.MachineID)
+		require.NotNil(t, ended.Booted)
+		require.False(t, *ended.Booted)
+		require.Zero(t, ended.Boot)
+		require.Zero(t, ended.Ran)
+
+		spends := spendsOf(t, m.service, log)
+		require.Len(t, spends, 1, "unbooted reservation still records its provider spend window")
+		require.Equal(t, watch.SourceReservation, spends[0].Source)
+		require.False(t, spends[0].Booted)
+		require.Equal(t, 3*time.Minute, spends[0].Duration)
+		require.Positive(t, spends[0].CostMicros)
+		require.Zero(t, spends[0].RevenueMicros)
+	})
+
+	// The reconciler ends a reservation it could not delete from what the
+	// record kept of it. That is still a machine that never came up, written
+	// once, and paid for until it is gone.
+	t.Run("a boot timeout whose delete is tried again is still never_up", func(t *testing.T) {
+		m := newBoughtMachine(t)
+		m.state.Reservations[0].CreatedAt = m.now
+		m.service.appConfig.ManagedCompute.Reservations.BootTimeout = types.Duration(3 * time.Minute)
+		log := recordOutcomes(m.service)
+		m.provider.FailDeletes(errors.New("provider is down"))
+
+		res := m.check(t, 3*time.Minute)
+		require.Equal(t, model.ReservationTerminating, res.Status)
+		require.Empty(t, outcomesOf(t, m.service, log), "the machine is not gone yet")
+		require.Empty(t, spendsOf(t, m.service, log))
+
+		m.provider.FailDeletes(nil)
+		res = m.check(t, 2*reconcileStatusCheckInterval)
+		require.Equal(t, model.ReservationDeleted, res.Status)
+
+		outcomes := outcomesOf(t, m.service, log)
+		require.Len(t, outcomes, 1)
+		require.Equal(t, watch.ResultNeverUp, outcomes[0].Result)
+		require.False(t, *outcomes[0].Booted)
+
+		spends := spendsOf(t, m.service, log)
+		require.Len(t, spends, 1)
+		require.Equal(t, 3*time.Minute+2*reconcileStatusCheckInterval, spends[0].Duration)
+		require.False(t, spends[0].Booted)
+	})
+
+	// A machine given back because the rest of its launch failed ends for
+	// the same reason, and says nothing of its provider.
+	t.Run("only a boot timeout is never_up", func(t *testing.T) {
+		require.True(t, bootTimedOut(reconcileReasonLaunchFailed, fmt.Sprintf("%s %s", bootTimedOutMessage, 20*time.Minute)))
+		require.False(t, bootTimedOut(reconcileReasonLaunchFailed, launchFailedMessage))
+		require.False(t, bootTimedOut(reconcileReasonProviderFailed, bootTimedOutMessage))
+	})
+}
+
+// A machine that is given back is billed up to then first, so what it cost
+// is written as spend once, with what its tenant paid, and its end adds no
+// second window for the same time.
+func TestAMachineGivenBackHasItsSpendWrittenOnce(t *testing.T) {
+	m := newRenewedMachine(t)
+	log := recordOutcomes(m.service)
+	reservation := &m.state.Reservations[0]
+	billedFrom := reservation.BillingCursorAt
+
+	require.NoError(t, m.service.releaseManagedReservation(context.Background(), "workspace-1", m.state, reservation))
+	require.Equal(t, model.ReservationDeleted, reservation.Status)
+
+	spends := spendsOf(t, m.service, log)
+	require.Len(t, spends, 1, "the final billing window, and no residual after it")
+	require.WithinDuration(t, billedFrom, spends[0].From, 0)
+	require.WithinDuration(t, reservation.BillingCursorAt, spends[0].At, 0)
+	require.Positive(t, spends[0].CostMicros)
+	require.Positive(t, spends[0].RevenueMicros)
+	require.True(t, spends[0].Booted)
+}
+
+func TestRecordManagedUsageMetricsIncludeRegionSpotAndProviderCost(t *testing.T) {
+	now := time.Now().UTC()
+	cursor := now.Add(-time.Hour)
+	state := managedUsageTestState(now, cursor, now.Add(time.Hour), 3_000_000)
+	state.Reservations[0].Provider = "verda"
+	state.Reservations[0].Cloud = "verda"
+	state.Reservations[0].Region = "FIN-01"
+	state.Reservations[0].Spot = true
+	state.Reservations[0].HourlyCostMicros = 2_000_000
+
+	billing := &fakeManagedBilling{}
+	usageRepo := &fakeUsageMetricsRepo{}
+	service := &Service{billing: billing, usageMetricsRepo: usageRepo}
+	log := recordOutcomes(service)
+
+	require.True(t, service.recordManagedUsage(context.Background(), "workspace-1", state, now, false))
+	require.Len(t, usageRepo.counters, 2)
+	for _, counter := range usageRepo.counters {
+		require.Equal(t, "FIN-01", counter.metadata["region"])
+		require.Equal(t, true, counter.metadata["spot"])
+		require.Equal(t, int64(2_000_000), counter.metadata["provider_hourly_cost_micros"])
+		require.InDelta(t, 200.0, counter.metadata["provider_cost_cents"], 0.01)
+	}
+
+	spends := spendsOf(t, service, log)
+	require.Len(t, spends, 1)
+	require.Equal(t, watch.SourceReservation, spends[0].Source)
+	require.Empty(t, spends[0].Pool, "reservation spend omits tenant pool name")
+	require.Equal(t, "verda", spends[0].Provider)
+	require.Equal(t, "FIN-01", spends[0].Region)
+	require.True(t, spends[0].Spot)
+	require.True(t, spends[0].Booted)
+	require.Equal(t, time.Hour, spends[0].Duration)
+	require.Equal(t, int64(2_000_000), spends[0].CostMicros)
+	require.Equal(t, int64(2_200_000), spends[0].RevenueMicros)
 }
